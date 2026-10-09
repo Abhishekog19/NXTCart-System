@@ -1,0 +1,42 @@
+# Credentials and device configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+products.json
+# Python
+.venv/
+.venV/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+# ROS builds
+build/
+build-v2/
+install/
+install-v2/
+log/
+log-v2/
+dist/
+*.log
+# Runtime and captured data
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
+*.pkl
+*.onnx
+*.tflite
+pc/references/
+pc/captures/
+pc/datasets/
+pc/results/
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
