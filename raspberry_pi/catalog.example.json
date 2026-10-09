@@ -1,0 +1,4 @@
+[
+  {"barcode": "REPLACE_WITH_REAL_QR_VALUE", "name": "Example product - replace all values",
+   "sku": "example_product", "expected_weight": 153.5, "tolerance_g": 8.0, "price": 35.0}
+]
