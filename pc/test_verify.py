@@ -1,0 +1,1404 @@
+# ---------------------------------------------------------------
+# test_verify.py  --  HEADLESS BRANCH COVERAGE (no camera, no model)
+#
+# WHAT THIS PROVES  (read this first)
+# ────────────────────────────────────
+# Tonight there is no hardware and no reference photos, so we cannot prove
+# RECOGNITION ACCURACY — that is tomorrow's job on real products.  What we
+# CAN prove tonight is that the CONTROL LOGIC is correct: that every verdict
+# branch is reachable and is reached for the right reason.
+#
+# The trick that makes this possible without a model or a camera:
+#   • a StubRecognizer whose appearance similarity is a number WE set, and
+#   • a colour histogram function whose colour similarity is a number WE set,
+# INDEPENDENTLY.  That lets us drive the verifier into each cell of its truth
+# table on demand — including the subtle "colour passes while appearance
+# fails" cell — instead of hoping a real image happens to land there.
+#
+# The follower is exercised with the OracleDetector (scripted detections),
+# so lock / ambiguous / merged / lost / reached-cart and the seq-dedupe rule
+# are each hit deterministically.
+#
+# Run:  python test_verify.py       (exits non-zero if any check fails)
+# ---------------------------------------------------------------
+
+from __future__ import annotations
+
+import sys
+
+import numpy as np
+
+from ml.config import (
+    ASSOC_AMBIGUOUS_MARGIN,
+    MERGE_AREA_RATIO,
+    VERIFY_APPEARANCE_THRESHOLD,
+    VERIFY_COLOR_THRESHOLD,
+    VERIFY_LOST_GRACE_FRAMES,
+    VERIFY_MIN_USABLE_FRAMES,
+    VERIFY_PASS_FRACTION,
+)
+from ml.detector import Detection
+from ml.frame_source import FrameMeta
+from ml.item_follower import FollowStatus, ItemFollower
+from ml.verifier import ColourReference, ProductVerifier, Verdict, colour_hist
+
+# ── a textured crop that ml.visibility.assess() will call usable ──────
+# Random noise has high grayscale std and high Laplacian energy, so it
+# clears both visibility cues — it stands in for "a clear view of a product"
+# without needing a real photo.
+_RNG = np.random.default_rng(0)
+
+
+def _usable_crop(size: int = 96) -> np.ndarray:
+    return _RNG.integers(0, 256, size=(size, size, 3), dtype=np.uint8)
+
+
+# ═════════════════════════════════════════════════════════════════
+# STUBS: independently controlled appearance + colour scores
+# ═════════════════════════════════════════════════════════════════
+
+class StubRecognizer:
+    """
+    A recognizer whose appearance similarity is whatever we say it is.
+
+    embed() returns a throwaway vector; similarity() ignores its arguments
+    and returns the fixed appearance score.  This decouples the appearance
+    channel from any real image content so tests can target a branch exactly.
+    """
+
+    def __init__(self, appearance_score: float) -> None:
+        self.appearance_score = appearance_score
+
+    def embed(self, crop: np.ndarray) -> np.ndarray:
+        return np.zeros(4, dtype=np.float32)
+
+    def similarity(self, a: np.ndarray, b: np.ndarray) -> float:
+        return self.appearance_score
+
+
+def _make_verifier(appearance_score: float, colour_score: float,
+                   sku: str = "sku_a", has_colour_ref: bool = True):
+    """
+    Build a ProductVerifier wired so appearance and colour each resolve to a
+    known score regardless of the actual crop.
+    """
+    recog = StubRecognizer(appearance_score)
+    # One appearance reference (its content is irrelevant — similarity is
+    # stubbed), so the SKU is "in the database".
+    appearance_db = {sku: [np.zeros(4, dtype=np.float32)]}
+
+    # Colour: a ColourReference whose best_similarity returns colour_score for
+    # any crop hist.  We achieve that with a 1-D hist of [colour_score] and a
+    # colour_hist_fn that returns [1.0] — their dot product is colour_score.
+    colour_db = {}
+    if has_colour_ref:
+        ref = ColourReference([np.array([colour_score], dtype=np.float32)])
+        colour_db = {sku: ref}
+
+    def colour_hist_fn(crop):
+        return np.array([1.0], dtype=np.float32)
+
+    return ProductVerifier(recog, appearance_db=appearance_db,
+                           colour_db=colour_db, colour_hist_fn=colour_hist_fn)
+
+
+# ═════════════════════════════════════════════════════════════════
+# tiny assert harness
+# ═════════════════════════════════════════════════════════════════
+
+_failures = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    status = "PASS" if cond else "FAIL"
+    print(f"  [{status}] {name}" + (f" — {detail}" if detail and not cond else ""))
+    if not cond:
+        _failures.append(name)
+
+
+# ═════════════════════════════════════════════════════════════════
+# VERIFIER TRUTH TABLE
+# ═════════════════════════════════════════════════════════════════
+
+def test_verifier_truth_table():
+    print("\n[verifier] verdict truth table")
+    crops = [_usable_crop() for _ in range(VERIFY_MIN_USABLE_FRAMES + 1)]
+
+    hi_app = VERIFY_APPEARANCE_THRESHOLD + 0.1
+    lo_app = VERIFY_APPEARANCE_THRESHOLD - 0.2
+    hi_col = VERIFY_COLOR_THRESHOLD + 0.1
+    lo_col = VERIFY_COLOR_THRESHOLD - 0.2
+
+    # appearance pass + colour pass -> MATCH
+    r = _make_verifier(hi_app, hi_col).verify("sku_a", crops)
+    check("MATCH  (app pass, col pass)", r.verdict == Verdict.MATCH, r.verdict)
+    check("MATCH is the only accepting verdict", r.accepted, str(r.accepted))
+
+    # appearance pass + colour fail -> SUSPECT  (the same-weight swap)
+    r = _make_verifier(hi_app, lo_col).verify("sku_a", crops)
+    check("SUSPECT (app pass, col fail)", r.verdict == Verdict.SUSPECT, r.verdict)
+    check("SUSPECT does not accept", not r.accepted, str(r.accepted))
+
+    # appearance fail + colour pass -> MISMATCH (colour alone never accepts)
+    r = _make_verifier(lo_app, hi_col).verify("sku_a", crops)
+    check("MISMATCH (app fail, col pass)", r.verdict == Verdict.MISMATCH, r.verdict)
+
+    # appearance fail + colour fail -> MISMATCH
+    r = _make_verifier(lo_app, lo_col).verify("sku_a", crops)
+    check("MISMATCH (app fail, col fail)", r.verdict == Verdict.MISMATCH, r.verdict)
+
+    # too few usable crops -> RETRY
+    few = [_usable_crop() for _ in range(VERIFY_MIN_USABLE_FRAMES - 1)]
+    r = _make_verifier(hi_app, hi_col).verify("sku_a", few)
+    check("RETRY (too few usable crops)", r.verdict == Verdict.RETRY, r.verdict)
+
+    # follower_broken -> RETRY regardless of crop content
+    r = _make_verifier(hi_app, hi_col).verify("sku_a", crops, follower_broken=True)
+    check("RETRY (follower broken)", r.verdict == Verdict.RETRY, r.verdict)
+
+    # SKU absent from DB -> UNAVAILABLE
+    r = _make_verifier(hi_app, hi_col).verify("no_such_sku", crops)
+    check("UNAVAILABLE (SKU not in DB)", r.verdict == Verdict.UNAVAILABLE, r.verdict)
+
+    # A SKU with NO colour reference can never reach MATCH (safe direction):
+    # colour cannot pass, so a perfect appearance resolves SUSPECT at best.
+    r = _make_verifier(hi_app, hi_col, has_colour_ref=False).verify("sku_a", crops)
+    check("no colour ref -> SUSPECT not MATCH", r.verdict == Verdict.SUSPECT, r.verdict)
+
+
+# ═════════════════════════════════════════════════════════════════
+# FOLLOWER STATE MACHINE  (scripted geometry)
+# ═════════════════════════════════════════════════════════════════
+
+FRAME_W, FRAME_H = 640, 480
+# SCANNER_REGION is the left 45%, CART_ENTRY_REGION the right 45% (config).
+# The cart-entry region starts at x=0.55*640=352, so a box whose centroid
+# crosses x=352 (box x >= 312 for an 80px box) counts as reached.
+SCANNER_X = 40      # inside the scanner region
+CART_X = 340        # box x=340 -> centroid 380, inside the cart-entry region
+
+# Association tolerates a centroid jump up to ASSOC_MAX_CENTROID_DIST (140px)
+# and rewards IoU overlap; a 60px step per frame stays well inside both, so a
+# smooth left→right transit associates every frame the way a real item would.
+_STEP = 60
+
+
+def _det(x, y=200, w=80, h=80, quality=1.0):
+    return Detection(bbox=(x, y, w, h), mask=None, quality=quality)
+
+
+def _transit_xs(start=SCANNER_X, end=CART_X, step=_STEP):
+    """Box x-positions for a smooth left→right transit, ending in the cart."""
+    xs = list(range(start, end, step))
+    xs.append(end)
+    return xs
+
+
+def _meta(seq):
+    return FrameMeta(seq=seq, ts=float(seq))
+
+
+def _frame():
+    # A textured frame so det.crop(frame) yields a usable crop.
+    return _RNG.integers(0, 256, size=(FRAME_H, FRAME_W, 3), dtype=np.uint8)
+
+
+def test_follower_lock_and_reach():
+    print("\n[follower] lock in scanner region, follow, reach cart")
+    f = ItemFollower((FRAME_W, FRAME_H))
+    frame = _frame()
+
+    xs = _transit_xs()
+    # Frame 0: one item in the scanner region -> lock, TRACKING.
+    st = f.update([_det(xs[0])], frame, _meta(0))
+    check("locks single scanner-region item", st == FollowStatus.TRACKING, st)
+
+    # Frames 1..n-1: item moves rightward in small steps, still tracking until
+    # the last, where its centroid crosses into the cart-entry region.
+    st = None
+    for i, x in enumerate(xs[1:], start=1):
+        st = f.update([_det(x)], frame, _meta(i))
+    check("reaches cart region", st == FollowStatus.REACHED_CART, st)
+    check("reached_cart flag set", f.reached_cart, str(f.reached_cart))
+    check("kept usable crops across path", f.usable_crop_count >= 3,
+          str(f.usable_crop_count))
+
+
+def test_follower_waits_when_scanner_crowded():
+    print("\n[follower] two items in scanner region -> no guess (WAITING)")
+    f = ItemFollower((FRAME_W, FRAME_H))
+    frame = _frame()
+    st = f.update([_det(30), _det(90, y=300)], frame, _meta(0))
+    check("does not lock when 2 contest scanner", st == FollowStatus.WAITING, st)
+    check("nothing locked yet", f.target_bbox is None, str(f.target_bbox))
+
+
+def test_follower_ambiguous():
+    print("\n[follower] two equally-good matches mid-follow -> AMBIGUOUS")
+    f = ItemFollower((FRAME_W, FRAME_H))
+    frame = _frame()
+    f.update([_det(SCANNER_X)], frame, _meta(0))          # lock at x=40
+    # Two detections placed symmetrically around the target (centroid x=80):
+    # equal centroid distance and equal IoU -> equal association score, well
+    # inside the ambiguity margin -> cannot tell which one IS the target.
+    st = f.update([_det(20), _det(60)], frame, _meta(1))
+    check("flags AMBIGUOUS on contested match",
+          st == FollowStatus.AMBIGUOUS, st)
+    check("AMBIGUOUS is a BROKEN status",
+          st in FollowStatus.BROKEN, st)
+
+
+def test_follower_merged():
+    print("\n[follower] blob balloons (item+hand fuse) -> MERGED")
+    f = ItemFollower((FRAME_W, FRAME_H))
+    frame = _frame()
+    f.update([_det(SCANNER_X, w=80, h=80)], frame, _meta(0))   # baseline area 6400
+    # Next frame the matched blob is far bigger than baseline*MERGE_AREA_RATIO.
+    big = int(80 * (MERGE_AREA_RATIO + 0.5) ** 0.5) + 40
+    st = f.update([_det(90, w=big, h=big)], frame, _meta(1))
+    check("flags MERGED on ballooning blob", st == FollowStatus.MERGED, st)
+    check("MERGED is a BROKEN status", st in FollowStatus.BROKEN, st)
+
+
+def test_follower_lost():
+    print("\n[follower] target disappears past grace -> LOST")
+    f = ItemFollower((FRAME_W, FRAME_H))
+    frame = _frame()
+    f.update([_det(SCANNER_X)], frame, _meta(0))   # lock
+    st = None
+    # No acceptable detection for more than the grace window.
+    for i in range(1, VERIFY_LOST_GRACE_FRAMES + 3):
+        st = f.update([], frame, _meta(i))
+    check("flags LOST after grace window", st == FollowStatus.LOST, st)
+    check("LOST is a BROKEN status", st in FollowStatus.BROKEN, st)
+
+
+def test_follower_seq_dedupe():
+    print("\n[follower] re-reading one frame (same seq) adds no second crop")
+    f = ItemFollower((FRAME_W, FRAME_H))
+    frame = _frame()
+    f.update([_det(SCANNER_X)], frame, _meta(0))
+    n_after_lock = f.usable_crop_count
+    # Same seq again: must be ignored entirely (no new crop, status unchanged).
+    st = f.update([_det(SCANNER_X)], frame, _meta(0))
+    check("same seq keeps crop count", f.usable_crop_count == n_after_lock,
+          f"{f.usable_crop_count} vs {n_after_lock}")
+    check("same seq does not change status", st == FollowStatus.TRACKING, st)
+    # A NEW seq for a slightly-moved detection (within association range) adds
+    # one more crop.
+    f.update([_det(SCANNER_X + _STEP)], frame, _meta(1))
+    check("new seq adds a crop", f.usable_crop_count == n_after_lock + 1,
+          str(f.usable_crop_count))
+
+
+# ═════════════════════════════════════════════════════════════════
+# CUSTODY: gating (both proofs), second-scan abort, broken-follow RETRY
+# ═════════════════════════════════════════════════════════════════
+
+def test_custody_gating_and_flow():
+    print("\n[custody] both proofs required; second scan aborts; broken -> RETRY")
+    from ml.custody import CustodyController
+    from ml.detector import OracleDetector
+    from ml.events import MockBarcodeSource, MockWeightSource
+
+    frame = _frame()
+
+    def build(app, col):
+        det = OracleDetector()
+        barcode = MockBarcodeSource(["sku_a"])
+        weight = MockWeightSource()
+        verifier = _make_verifier(app, col)
+        ctrl = CustodyController(det, verifier, barcode, weight,
+                                 frame_size=(FRAME_W, FRAME_H))
+        return det, barcode, weight, ctrl
+
+    hi_app = VERIFY_APPEARANCE_THRESHOLD + 0.1
+    hi_col = VERIFY_COLOR_THRESHOLD + 0.1
+
+    xs = _transit_xs()
+
+    # --- reached cart but NO weight settle -> no verdict yet ---
+    det, barcode, weight, ctrl = build(hi_app, hi_col)
+    barcode.scan("sku_a")
+    seq = 0
+    r = None
+    for x in xs:                        # smooth transit into the cart region
+        det.set([_det(x)]); r = ctrl.process(frame, _meta(seq)); seq += 1
+    check("reached cart, no weight -> withholds verdict", r is None, str(r))
+    check("follower reached cart", ctrl.reached_cart, str(ctrl.reached_cart))
+
+    # --- now the weight changes then settles (events arrive over frames) ---
+    # The mock emits CHANGING first, SETTLED next; custody polls one event per
+    # frame, exactly as the Arduino serial driver will feed them.
+    weight.begin_change()
+    det.set([_det(xs[-1])]); r = ctrl.process(frame, _meta(seq)); seq += 1
+    check("reached cart + only CHANGING seen -> still withholds", r is None, str(r))
+    weight.settle(250.0)
+    det.set([_det(xs[-1])]); r = ctrl.process(frame, _meta(seq)); seq += 1
+    check("both proofs in -> verdict produced", r is not None, str(r))
+    check("clean transit + good scores -> MATCH",
+          r is not None and r.verdict == Verdict.MATCH,
+          r.verdict if r else "None")
+
+    # --- weight fully settles but item never reaches cart -> no verdict ---
+    # Proves the SPATIAL gate is doing the withholding: both weight events are
+    # consumed (weight_settled becomes True) yet the item stays left of cart.
+    det, barcode, weight, ctrl = build(hi_app, hi_col)
+    barcode.scan("sku_a")
+    det.set([_det(SCANNER_X)]); ctrl.process(frame, _meta(100))
+    weight.begin_change()
+    det.set([_det(SCANNER_X + _STEP)]); ctrl.process(frame, _meta(101))
+    weight.settle(250.0)
+    det.set([_det(SCANNER_X + _STEP)]); r = ctrl.process(frame, _meta(102))
+    check("weight settled but not reached cart -> withholds verdict",
+          r is None, str(r))
+    check("weight_settled true, reached_cart false",
+          ctrl.weight_settled and not ctrl.reached_cart,
+          f"settled={ctrl.weight_settled} reached={ctrl.reached_cart}")
+
+    # --- second scan while open aborts the first as RETRY ---
+    det, barcode, weight, ctrl = build(hi_app, hi_col)
+    barcode.scan("sku_a")
+    det.set([_det(SCANNER_X)]); ctrl.process(frame, _meta(200))
+    barcode.scan("sku_a")               # a new scan arrives mid-transaction
+    det.set([_det(SCANNER_X + _STEP)]); r = ctrl.process(frame, _meta(201))
+    check("second scan aborts open txn as RETRY",
+          r is not None and r.verdict == Verdict.RETRY,
+          r.verdict if r else "None")
+
+    # --- broken follow (ambiguous) resolves RETRY ---
+    det, barcode, weight, ctrl = build(hi_app, hi_col)
+    barcode.scan("sku_a")
+    det.set([_det(SCANNER_X)]); ctrl.process(frame, _meta(300))
+    det.set([_det(20), _det(60)]); r = ctrl.process(frame, _meta(301))
+    check("broken follow -> RETRY",
+          r is not None and r.verdict == Verdict.RETRY,
+          r.verdict if r else "None")
+
+
+# ═════════════════════════════════════════════════════════════════
+# JOINT PASS: appearance AND colour must agree on the SAME crop
+# ═════════════════════════════════════════════════════════════════
+
+class SeqRecognizer:
+    """
+    A recognizer whose appearance similarity is a DIFFERENT scripted number
+    per crop (in crop order), so we can drive individual crops above/below the
+    threshold independently — impossible with the fixed-score StubRecognizer.
+    """
+
+    def __init__(self, scores) -> None:
+        self.scores = list(scores)
+        self.i = 0
+
+    def embed(self, crop):
+        return np.zeros(4, dtype=np.float32)
+
+    def similarity(self, a, b):
+        # verify() calls this exactly once per crop (one appearance ref), so
+        # the counter tracks the crop index.
+        s = self.scores[self.i % len(self.scores)]
+        self.i += 1
+        return s
+
+
+def _make_scripted_verifier(app_scores, col_scores, sku: str = "sku_a"):
+    """
+    Build a verifier whose appearance AND colour scores are scripted per crop,
+    aligned to crop order, so a specific pattern of per-crop passes can be
+    constructed (e.g. appearance and colour passing on DIFFERENT crops).
+    """
+    recog = SeqRecognizer(app_scores)
+    appearance_db = {sku: [np.zeros(4, dtype=np.float32)]}
+    # Colour ref of [1.0]; a per-crop colour_hist_fn returns [score_i], so
+    # best_similarity == score_i for crop i.
+    colour_db = {sku: ColourReference([np.array([1.0], dtype=np.float32)])}
+    state = {"i": 0}
+
+    def colour_hist_fn(crop):
+        v = col_scores[state["i"] % len(col_scores)]
+        state["i"] += 1
+        return np.array([v], dtype=np.float32)
+
+    return ProductVerifier(recog, appearance_db=appearance_db,
+                           colour_db=colour_db, colour_hist_fn=colour_hist_fn)
+
+
+def test_verifier_joint_pass_required():
+    print("\n[verifier] MATCH needs BOTH channels on the SAME crop (anti-swap)")
+    hi_app = VERIFY_APPEARANCE_THRESHOLD + 0.1
+    lo_app = VERIFY_APPEARANCE_THRESHOLD - 0.2
+    hi_col = VERIFY_COLOR_THRESHOLD + 0.1
+    lo_col = VERIFY_COLOR_THRESHOLD - 0.2
+    crops = [_usable_crop() for _ in range(4)]
+
+    # ANTI-CORRELATED: appearance passes on crops 0,1; colour passes on 2,3.
+    # Each channel clears 50% on its own — the OLD separate-fraction logic
+    # would have called this MATCH — but NO single crop passes both, which is
+    # exactly the evidence a same-weight swap can fake.  Must NOT be MATCH.
+    app = [hi_app, hi_app, lo_app, lo_app]
+    col = [lo_col, lo_col, hi_col, hi_col]
+    r = _make_scripted_verifier(app, col).verify("sku_a", crops)
+    check("anti-correlated passes -> NOT MATCH",
+          r.verdict != Verdict.MATCH, r.verdict)
+    check("anti-correlated -> SUSPECT (appearance carried, colour didn't)",
+          r.verdict == Verdict.SUSPECT, r.verdict)
+    check("no crop passed both -> joint_pass_frac == 0",
+          r.joint_pass_frac == 0.0, str(r.joint_pass_frac))
+    check("but each channel DID clear 50% separately (the trap)",
+          r.appearance_pass_frac == 0.5 and r.colour_pass_frac == 0.5,
+          f"app={r.appearance_pass_frac} col={r.colour_pass_frac}")
+    check("anti-correlated result is not accepted", not r.accepted,
+          str(r.accepted))
+
+    # CORRELATED: both channels pass together on crops 0,1,2 (colour varies
+    # per crop, proving per-crop scoring is real) -> joint fraction high.
+    app = [hi_app, hi_app + 0.05, hi_app + 0.02, lo_app]
+    col = [hi_col, hi_col, hi_col, hi_col]
+    r = _make_scripted_verifier(app, col).verify("sku_a", crops)
+    joint_expected = 3 / 4  # crops 0,1,2 pass both
+    check("jointly-passing crops -> MATCH",
+          r.verdict == Verdict.MATCH and joint_expected >= VERIFY_PASS_FRACTION,
+          f"{r.verdict} joint={r.joint_pass_frac}")
+
+
+# ═════════════════════════════════════════════════════════════════
+# ONLY MATCH ACCEPTS  (UNAVAILABLE / MISMATCH / SUSPECT / RETRY block)
+# ═════════════════════════════════════════════════════════════════
+
+def test_only_match_accepts():
+    print("\n[verifier] only MATCH accepts; UNAVAILABLE & others block")
+    crops = [_usable_crop() for _ in range(VERIFY_MIN_USABLE_FRAMES + 1)]
+    hi_app = VERIFY_APPEARANCE_THRESHOLD + 0.1
+    hi_col = VERIFY_COLOR_THRESHOLD + 0.1
+    lo = VERIFY_APPEARANCE_THRESHOLD - 0.2
+    lo_col = VERIFY_COLOR_THRESHOLD - 0.2
+
+    cases = [
+        ("UNAVAILABLE", _make_verifier(hi_app, hi_col).verify("nope", crops)),
+        ("MISMATCH", _make_verifier(lo, lo_col).verify("sku_a", crops)),
+        ("SUSPECT", _make_verifier(hi_app, lo_col).verify("sku_a", crops)),
+        ("RETRY", _make_verifier(hi_app, hi_col).verify("sku_a", crops,
+                                                        follower_broken=True)),
+    ]
+    for label, r in cases:
+        check(f"{label} does not accept (never weight-only pass)",
+              not r.accepted, f"{r.verdict} accepted={r.accepted}")
+    r = _make_verifier(hi_app, hi_col).verify("sku_a", crops)
+    check("MATCH accepts", r.accepted, r.verdict)
+
+
+# ═════════════════════════════════════════════════════════════════
+# COLOUR: white / low-saturation packaging is represented (format v2)
+# ═════════════════════════════════════════════════════════════════
+
+def _solid_bgr(b, g, r, size: int = 64, noise: int = 4) -> np.ndarray:
+    img = np.empty((size, size, 3), dtype=np.uint8)
+    img[:, :, 0] = b
+    img[:, :, 1] = g
+    img[:, :, 2] = r
+    if noise:
+        jitter = _RNG.integers(-noise, noise + 1, img.shape)
+        img = np.clip(img.astype(int) + jitter, 0, 255).astype(np.uint8)
+    return img
+
+
+def test_colour_low_saturation():
+    print("\n[verifier] white/low-saturation packaging gets a real fingerprint")
+    white1 = _solid_bgr(235, 235, 235)   # near-white, unsaturated
+    white2 = _solid_bgr(228, 230, 233)   # another near-white
+    blue = _solid_bgr(200, 60, 60)       # strongly saturated (BGR blue)
+
+    # v1 would have produced an all-zero vector for an unsaturated crop; v2
+    # must not — a white box now has a non-zero colour fingerprint.
+    n_white = float(np.linalg.norm(colour_hist(white1)))
+    check("white crop -> non-zero colour fingerprint (v2)", n_white > 0.0,
+          f"norm={n_white:.3f}")
+
+    ref = ColourReference([colour_hist(white1)])
+    s_white = ref.best_similarity(colour_hist(white2))
+    s_blue = ref.best_similarity(colour_hist(blue))
+    check("white matches white (>= colour threshold)",
+          s_white >= VERIFY_COLOR_THRESHOLD, f"{s_white:.3f}")
+    check("coloured swap fails against a white reference",
+          s_blue < VERIFY_COLOR_THRESHOLD, f"{s_blue:.3f}")
+
+
+# ═════════════════════════════════════════════════════════════════
+# PRODUCT CROP: shared cropper resolves / refuses deterministically
+# ═════════════════════════════════════════════════════════════════
+
+def test_product_crop():
+    print("\n[crop] crop_product resolves one product and refuses ambiguity")
+    from ml.product_crop import CropStatus, crop_product
+
+    H, W = 480, 640
+
+    def canvas():
+        return np.full((H, W, 3), 127, dtype=np.uint8)
+
+    def put_square(img, x, y, s, val=240):
+        # A solid contrasting square: its edges carry strong gradient, so the
+        # cropper sees one product-shaped region.
+        img[y:y + s, x:x + s] = val
+
+    # Blank frame -> EMPTY (no product-like texture).
+    r = crop_product(canvas())
+    check("blank frame -> EMPTY", r.status == CropStatus.EMPTY, r.status)
+
+    # One clear product filling enough of the frame -> OK with a crop.
+    img = canvas(); put_square(img, 200, 130, 240)
+    r = crop_product(img)
+    check("single clear product -> OK", r.status == CropStatus.OK,
+          f"{r.status} ({r.reason})")
+    check("OK yields a non-empty crop",
+          r.ok and r.crop is not None and r.crop.size > 0, "no crop")
+
+    # A product that fills too little of the frame -> TOO_SMALL.
+    img = canvas(); put_square(img, 300, 220, 80)
+    r = crop_product(img)
+    check("far-away product -> TOO_SMALL", r.status == CropStatus.TOO_SMALL,
+          f"{r.status} (area {r.area_frac:.3f})")
+
+    # Two comparable regions -> AMBIGUOUS (refuse to guess which is THE item).
+    img = canvas(); put_square(img, 60, 150, 170); put_square(img, 410, 150, 170)
+    r = crop_product(img)
+    check("two comparable regions -> AMBIGUOUS",
+          r.status == CropStatus.AMBIGUOUS, r.status)
+
+
+# ═════════════════════════════════════════════════════════════════
+# CUSTODY: transaction id on results; stale / mismatched weight dropped
+# ═════════════════════════════════════════════════════════════════
+
+def test_txn_id_and_weight_binding():
+    print("\n[custody] txn id stamped on result; stale/mismatched weight dropped")
+    from ml.custody import CustodyController
+    from ml.detector import OracleDetector
+    from ml.events import MockBarcodeSource, MockWeightSource
+
+    frame = _frame()
+    hi_app = VERIFY_APPEARANCE_THRESHOLD + 0.1
+    hi_col = VERIFY_COLOR_THRESHOLD + 0.1
+    xs = _transit_xs()
+
+    def build():
+        det = OracleDetector()
+        barcode = MockBarcodeSource()
+        weight = MockWeightSource()
+        verifier = _make_verifier(hi_app, hi_col)
+        ctrl = CustodyController(det, verifier, barcode, weight,
+                                 frame_size=(FRAME_W, FRAME_H))
+        return det, barcode, weight, ctrl
+
+    def transit(det, ctrl, start_seq):
+        seq = start_seq
+        for x in xs:
+            det.set([_det(x)]); ctrl.process(frame, _meta(seq)); seq += 1
+        return seq
+
+    # (a) a backend-provided txn id flows onto the result; weight_delta surfaced
+    det, barcode, weight, ctrl = build()
+    barcode.scan("sku_a", txn_id="T-100")
+    seq = transit(det, ctrl, 0)
+    weight.begin_change()
+    det.set([_det(xs[-1])]); ctrl.process(frame, _meta(seq)); seq += 1
+    weight.settle(250.0, txn_id="T-100")
+    det.set([_det(xs[-1])]); r = ctrl.process(frame, _meta(seq)); seq += 1
+    check("result carries the backend txn id",
+          r is not None and r.txn_id == "T-100", r.txn_id if r else "None")
+    check("result surfaces the settled weight delta",
+          r is not None and abs(r.weight_delta - 250.0) < 1e-6,
+          str(r.weight_delta if r else None))
+    check("all proofs + good scores -> MATCH",
+          r is not None and r.verdict == Verdict.MATCH,
+          r.verdict if r else "None")
+
+    # (b) a settle tagged for a DIFFERENT txn must NOT complete this one
+    det, barcode, weight, ctrl = build()
+    barcode.scan("sku_a", txn_id="T-200")
+    seq = transit(det, ctrl, 400)
+    weight.begin_change()
+    det.set([_det(xs[-1])]); ctrl.process(frame, _meta(seq)); seq += 1
+    weight.settle(250.0, txn_id="WRONG")
+    det.set([_det(xs[-1])]); r = ctrl.process(frame, _meta(seq)); seq += 1
+    check("mismatched-txn settle is dropped (no verdict)", r is None, str(r))
+    check("mismatched settle does not bind weight",
+          not ctrl.weight_settled, str(ctrl.weight_settled))
+    weight.settle(250.0, txn_id="T-200")   # the correct one now completes it
+    det.set([_det(xs[-1])]); r = ctrl.process(frame, _meta(seq)); seq += 1
+    check("correct-txn settle completes the transaction",
+          r is not None and r.verdict == Verdict.MATCH,
+          r.verdict if r else "None")
+
+    # (c) a stale settle (time-stamped before this scan opened) is dropped
+    det, barcode, weight, ctrl = build()
+    barcode.scan("sku_a", txn_id="T-300")
+    seq = transit(det, ctrl, 500)
+    weight.begin_change()
+    det.set([_det(xs[-1])]); ctrl.process(frame, _meta(seq)); seq += 1
+    weight.settle(250.0, txn_id="T-300", ts=0.0)   # ts=0 predates started_ts
+    det.set([_det(xs[-1])]); r = ctrl.process(frame, _meta(seq)); seq += 1
+    check("stale settle (old timestamp) is dropped",
+          r is None and not ctrl.weight_settled,
+          f"r={r} settled={ctrl.weight_settled}")
+
+
+# ═════════════════════════════════════════════════════════════════
+# BACKEND SEAM  (local and AI are interchangeable peers)
+# ═════════════════════════════════════════════════════════════════
+
+def test_backend_protocol():
+    print("\n[backends] the two verifiers are interchangeable")
+    from ml.ai_backend import VLMBackend
+    from ml.backends import LocalBackend, VerificationBackend
+
+    verifier = _make_verifier(0.9, 0.9)
+    local = LocalBackend(verifier)
+
+    # runtime_checkable Protocol: both must satisfy it, or compare_backends
+    # cannot treat them as peers.
+    check("LocalBackend satisfies VerificationBackend",
+          isinstance(local, VerificationBackend))
+    check("VLMBackend satisfies VerificationBackend",
+          isinstance(VLMBackend(api_key="x"), VerificationBackend))
+
+    # The wrapper must not change the verdict — it exists only to add a name.
+    crops = [_usable_crop() for _ in range(VERIFY_MIN_USABLE_FRAMES + 1)]
+    direct = verifier.verify("sku_a", crops)
+    wrapped = local.verify("sku_a", crops)
+    check("LocalBackend forwards unchanged",
+          wrapped.verdict == direct.verdict == Verdict.MATCH,
+          f"{wrapped.verdict} vs {direct.verdict}")
+    check("LocalBackend has a name for the table", local.name == "local")
+
+
+# ═════════════════════════════════════════════════════════════════
+# AI BACKEND: reply -> verdict mapping
+# ═════════════════════════════════════════════════════════════════
+
+class FakeHTTP:
+    """
+    Stands in for the `requests` module inside ml.ai_backend._ask.
+
+    The backend imports requests lazily *inside* the method, so injecting a
+    fake into sys.modules exercises the REAL code path — payload build, HTTP
+    handling, JSON parse, verdict mapping — with only the socket replaced.
+    Testing just the mapping function would skip the parts most likely to
+    break.
+    """
+
+    class Timeout(Exception):
+        pass
+
+    def __init__(self, reply=None, status=200, usage=None, raise_exc=None,
+                 body=None):
+        self.reply = reply
+        self.status = status
+        self.usage = usage or {"prompt_tokens": 1800, "completion_tokens": 20,
+                               "total_tokens": 1820}
+        self.raise_exc = raise_exc
+        self.body = body
+        self.calls = []
+
+    def post(self, url, headers=None, json=None, timeout=None):
+        self.calls.append({"url": url, "json": json, "timeout": timeout})
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        return _FakeResponse(self.status, self.reply, self.usage, self.body)
+
+
+class _FakeResponse:
+    def __init__(self, status, reply, usage, body=None):
+        self.status_code = status
+        self._reply = reply
+        self._usage = usage
+        self._body = body
+        self.text = reply if isinstance(reply, str) else "error body"
+
+    def json(self):
+        if self._body is not None:
+            return self._body
+        return {"choices": [{"message": {"content": self._reply}}],
+                "usage": self._usage}
+
+
+def _ai_verdict(reply=None, status=200, raise_exc=None, body=None,
+                n_crops=None):
+    """Drive VLMBackend with a canned HTTP layer and return its VerdictResult."""
+    import sys as _sys
+    from ml.ai_backend import VLMBackend
+
+    fake = FakeHTTP(reply=reply, status=status, raise_exc=raise_exc, body=body)
+    saved = _sys.modules.get("requests")
+    _sys.modules["requests"] = fake
+    try:
+        backend = VLMBackend(api_key="test-key", references_dir=None)
+        n = n_crops if n_crops is not None else VERIFY_MIN_USABLE_FRAMES + 1
+        crops = [_usable_crop() for _ in range(n)]
+        return backend.verify("sku_a", crops), fake
+    finally:
+        if saved is not None:
+            _sys.modules["requests"] = saved
+        else:
+            _sys.modules.pop("requests", None)
+
+
+def test_ai_verdict_mapping():
+    print("\n[ai] model reply -> verdict")
+
+    r, fake = _ai_verdict('{"matches": true, "confident": true, '
+                          '"reason": "Lays Classic, red bag"}')
+    check("confident yes -> MATCH", r.verdict == Verdict.MATCH, r.verdict)
+    check("reason is carried through", "red bag" in r.reason, r.reason)
+    check("token usage recorded", getattr(r, "ai_tokens", 0) == 1820,
+          str(getattr(r, "ai_tokens", None)))
+
+    r, _ = _ai_verdict('{"matches": true, "confident": false, '
+                       '"reason": "blurry"}')
+    check("unsure yes -> SUSPECT (not MATCH)", r.verdict == Verdict.SUSPECT,
+          r.verdict)
+
+    r, _ = _ai_verdict('{"matches": false, "confident": true, '
+                       '"reason": "this is a blue box, not red"}')
+    check("confident no -> MISMATCH", r.verdict == Verdict.MISMATCH, r.verdict)
+
+    r, _ = _ai_verdict('{"matches": false, "confident": false, '
+                       '"reason": "cannot see it"}')
+    check("unsure no -> SUSPECT (does not accuse)",
+          r.verdict == Verdict.SUSPECT, r.verdict)
+
+    # The request itself must be well formed, or a live call would 400.
+    _, fake = _ai_verdict('{"matches": true, "confident": true, "reason": "x"}')
+    payload = fake.calls[0]["json"]
+    content = payload["messages"][1]["content"]
+    check("endpoint is /chat/completions",
+          fake.calls[0]["url"].endswith("/chat/completions"),
+          fake.calls[0]["url"])
+    check("three images are sent in one request",
+          sum(1 for p in content if p.get("type") == "image_url") == 3
+          and len(fake.calls) == 1)
+    check("image is a base64 data URI",
+          next(p for p in content if p.get("type") == "image_url")
+          ["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+    check("temperature is 0 (repeatable)", payload["temperature"] == 0)
+    check("timeout is passed to requests", fake.calls[0]["timeout"] > 0)
+
+    from ml.ai_backend import VLMBackend, _select_crops
+    from unittest.mock import patch
+    from types import SimpleNamespace
+    crops = [np.full((64, 64, 3), i, dtype=np.uint8) for i in range(9)]
+    with patch("ml.ai_backend.assess", side_effect=lambda c:
+               SimpleNamespace(usable=True, edges=float(c[0, 0, 0]))):
+        picked = _select_crops(crops, 3)
+        check("sharp views span early middle late in order",
+              [int(c[0, 0, 0]) for c in picked] == [2, 5, 8])
+        check("exact repeated images are not resent",
+              len(_select_crops([crops[0]] * 9, 3)) == 1)
+        check("single-image baseline picks sharpest",
+              int(_select_crops(crops, 1)[0][0, 0, 0]) == 8)
+    for limit in (1, 3, 5):
+        fake = FakeHTTP(reply='{"matches":true,"confident":true,"reason":"ok"}')
+        with patch.dict(sys.modules, {"requests": fake}):
+            backend = VLMBackend(api_key="test", max_frames=limit, references_dir=None)
+            backend.verify("sku_a", [_usable_crop() for _ in range(12)])
+        parts = fake.calls[0]["json"]["messages"][1]["content"]
+        check(f"configured {limit} images share one HTTP call",
+              len(fake.calls) == 1 and sum(p["type"] == "image_url" for p in parts) == limit)
+        check(f"stats record {limit} sent images", backend.stats[0].images_sent == limit)
+    for invalid in (0, 6, -1, True, 2.5):
+        try:
+            VLMBackend(max_frames=invalid)
+            rejected = False
+        except ValueError:
+            rejected = True
+        check(f"invalid image limit {invalid!r} rejected", rejected)
+
+
+# ═════════════════════════════════════════════════════════════════
+# AI BACKEND: every failure path must fail CLOSED
+# ═════════════════════════════════════════════════════════════════
+
+def test_ai_fails_closed():
+    print("\n[ai] every failure resolves RETRY, never MATCH")
+
+    cases = [
+        ("network timeout", dict(raise_exc=FakeHTTP.Timeout("timed out"))),
+        ("HTTP 500", dict(reply="upstream exploded", status=500)),
+        ("HTTP 429 rate limited", dict(reply="slow down", status=429)),
+        ("empty reply", dict(reply="")),
+        ("prose, no JSON", dict(reply="I think that looks like the product!")),
+        ("malformed JSON", dict(reply='{"matches": true, "conf')),
+        ("missing 'confident'", dict(reply='{"matches": true}')),
+        ("missing 'matches'", dict(reply='{"confident": true}')),
+        ("non-boolean matches", dict(reply='{"matches": "yes", '
+                                           '"confident": true}')),
+        ("wrong response shape", dict(body={"unexpected": "shape"})),
+    ]
+    for name, kwargs in cases:
+        r, _ = _ai_verdict(**kwargs)
+        check(f"{name} -> RETRY", r.verdict == Verdict.RETRY, r.verdict)
+        check(f"{name} does not accept", not r.accepted, r.verdict)
+
+    # No key and a remote host: must not even try, and must not accept.
+    # The env vars are popped first because VLMBackend falls back to them, so
+    # a developer with a real key exported would otherwise not run this test.
+    import os as _os
+
+    from ml.ai_backend import VLMBackend
+    saved = (_os.environ.pop("OPENROUTER_API_KEY", None),
+             _os.environ.pop("OPENAI_API_KEY", None))
+    try:
+        backend = VLMBackend(api_key="", references_dir=None)
+        crops = [_usable_crop() for _ in range(VERIFY_MIN_USABLE_FRAMES + 1)]
+        r = backend.verify("sku_a", crops)
+        check("no API key -> RETRY", r.verdict == Verdict.RETRY, r.verdict)
+    finally:
+        if saved[0] is not None:
+            _os.environ["OPENROUTER_API_KEY"] = saved[0]
+        if saved[1] is not None:
+            _os.environ["OPENAI_API_KEY"] = saved[1]
+
+    # Guard parity with the local path: the same too-few-crops and
+    # broken-custody rules, so the comparison measures models, not guards.
+    r, fake = _ai_verdict('{"matches": true, "confident": true, "reason": "x"}',
+                          n_crops=VERIFY_MIN_USABLE_FRAMES - 1)
+    check("too few crops -> RETRY (same rule as local)",
+          r.verdict == Verdict.RETRY, r.verdict)
+    check("too few crops makes no API call", len(fake.calls) == 0,
+          f"{len(fake.calls)} calls")
+
+    from ml.ai_backend import VLMBackend as _V
+    b = _V(api_key="k")
+    r = b.verify("sku_a", [_usable_crop() for _ in range(6)],
+                 follower_broken=True)
+    check("broken custody -> RETRY", r.verdict == Verdict.RETRY, r.verdict)
+
+
+def test_ai_reply_parsing():
+    print("\n[ai] tolerant parsing of real-world model output")
+    from ml.ai_backend import _parse
+
+    ok = _parse('{"matches": true, "confident": true, "reason": "red bag"}')
+    check("plain JSON parses", ok == (True, True, "red bag"), str(ok))
+
+    fenced = _parse('```json\n{"matches": false, "confident": true, '
+                    '"reason": "blue"}\n```')
+    check("```json fenced block parses", fenced == (False, True, "blue"),
+          str(fenced))
+
+    chatty = _parse('Sure! Here is my answer:\n'
+                    '{"matches": true, "confident": false, "reason": "dark"}')
+    check("JSON after prose parses", chatty == (True, False, "dark"),
+          str(chatty))
+
+    no_reason = _parse('{"matches": true, "confident": true}')
+    check("missing reason is tolerated (not a safety field)",
+          no_reason is not None and no_reason[0] is True, str(no_reason))
+
+    # And the things that must NOT parse, because a default here would be a
+    # silent accept.
+    for bad, why in [
+        ('{"matches": true}', "missing confident"),
+        ('{"confident": true}', "missing matches"),
+        ('{"matches": 1, "confident": true}', "int instead of bool"),
+        ('{"matches": "true", "confident": "true"}', "strings not bools"),
+        ("", "empty"),
+        ("not json at all", "prose only"),
+        ("[1,2,3]", "wrong JSON type"),
+    ]:
+        check(f"refuses: {why}", _parse(bad) is None, repr(bad))
+
+
+# ═════════════════════════════════════════════════════════════════
+# COMPARISON METRICS  (FAR / FRR are the decision, so they must be right)
+# ═════════════════════════════════════════════════════════════════
+
+def test_comparison_metrics():
+    print("\n[compare] FAR / FRR arithmetic")
+    from compare_backends import (BackendRun, Case, LABEL_GENUINE, LABEL_SWAP,
+                                  _mark, summarise)
+
+    cases = [
+        Case("g1", "sku_a", LABEL_GENUINE),
+        Case("g2", "sku_a", LABEL_GENUINE),
+        Case("g3", "sku_a", LABEL_GENUINE),
+        Case("g4", "sku_a", LABEL_GENUINE),
+        Case("s1", "sku_a", LABEL_SWAP),
+        Case("s2", "sku_a", LABEL_SWAP),
+        Case("s3", "sku_a", LABEL_SWAP),
+        Case("s4", "sku_a", LABEL_SWAP),
+    ]
+    run = BackendRun(name="t")
+    run.verdicts = {
+        "g1": Verdict.MATCH,       # correct
+        "g2": Verdict.MATCH,       # correct
+        "g3": Verdict.MISMATCH,    # FALSE REJECT
+        "g4": Verdict.RETRY,       # friction, not an error
+        "s1": Verdict.MISMATCH,    # caught
+        "s2": Verdict.SUSPECT,     # caught (flagged)
+        "s3": Verdict.MATCH,       # FALSE ACCEPT — theft
+        "s4": Verdict.RETRY,       # not judged
+    }
+    s = summarise(run, cases)
+
+    check("FAR = 1 of 4 swaps", abs(s["far"] - 0.25) < 1e-9, str(s["far"]))
+    check("FRR = 1 of 4 genuine", abs(s["frr"] - 0.25) < 1e-9, str(s["frr"]))
+    check("catch rate = 2 of 4 swaps", abs(s["catch_rate"] - 0.5) < 1e-9,
+          str(s["catch_rate"]))
+    check("pass rate = 2 of 4 genuine", abs(s["pass_rate"] - 0.5) < 1e-9,
+          str(s["pass_rate"]))
+    check("retry rate = 2 of 8", abs(s["retry_rate"] - 0.25) < 1e-9,
+          str(s["retry_rate"]))
+    check("the false accept is named", s["false_accepts"] == ["s3"],
+          str(s["false_accepts"]))
+    check("the false reject is named", s["false_rejects"] == ["g3"],
+          str(s["false_rejects"]))
+
+    # SUSPECT on a genuine item IS a false reject: the shopper is stopped.
+    run2 = BackendRun(name="t2")
+    run2.verdicts = {c.name: Verdict.SUSPECT for c in cases}
+    s2 = summarise(run2, cases)
+    check("SUSPECT on genuine counts as a false reject",
+          abs(s2["frr"] - 1.0) < 1e-9, str(s2["frr"]))
+    check("SUSPECT on a swap is a catch, not an accept",
+          s2["far"] == 0.0 and abs(s2["catch_rate"] - 1.0) < 1e-9,
+          f"far={s2['far']} catch={s2['catch_rate']}")
+
+    # The marks that drive the printed report.
+    check("swap+MATCH marks as danger",
+          _mark(LABEL_SWAP, Verdict.MATCH) == "!!")
+    check("genuine+MISMATCH marks as false reject",
+          _mark(LABEL_GENUINE, Verdict.MISMATCH) == "xx")
+    check("genuine+MATCH marks ok", _mark(LABEL_GENUINE, Verdict.MATCH) == "ok")
+    check("swap+MISMATCH marks ok", _mark(LABEL_SWAP, Verdict.MISMATCH) == "ok")
+    check("a crash never marks ok", _mark(LABEL_GENUINE, "ERROR") == "!!")
+
+    # An all-RETRY backend has a perfect FAR and is useless. The report must
+    # be able to show that, or it would recommend the safest useless thing.
+    run3 = BackendRun(name="t3")
+    run3.verdicts = {c.name: Verdict.RETRY for c in cases}
+    s3 = summarise(run3, cases)
+    check("all-RETRY backend: FAR 0 but retry rate 100%",
+          s3["far"] == 0.0 and abs(s3["retry_rate"] - 1.0) < 1e-9,
+          f"far={s3['far']} retry={s3['retry_rate']}")
+
+
+def test_bakeoff_ranking():
+    """
+    The four-way bake-off decides which CAMERA gets bought. Its ranking is
+    therefore the highest-consequence pure function in the repo, and it has
+    already been wrong once: `frr or 1.0` treated a perfect 0.0% false-reject
+    rate as falsy and replaced it with the worst possible score, ranking a
+    flawless configuration last. These checks exist so that cannot recur.
+    """
+    print("\n[bakeoff] ranking policy")
+    from run_bakeoff import Cell, rank_cells
+
+    def cell(no, camera, backend, far, frr, retry=0.0):
+        c = Cell(no, camera, backend, "ds", "db")
+        c.summary = {"far": far, "frr": frr, "retry_rate": retry}
+        return c
+
+    # A PERFECT config must rank first. This is the regression: 0.0 is falsy.
+    perfect = cell(3, "webcam", "local", 0.0, 0.0)
+    same_far_worse_frr = cell(4, "webcam", "ai", 0.0, 0.25)
+    ranked = rank_cells([same_far_worse_frr, perfect])
+    check("a perfect 0.0 FRR is not treated as the worst FRR",
+          ranked[0] is perfect, f"first={ranked[0].label}")
+
+    # FAR outranks FRR: letting a theft through is worse than annoying a
+    # shopper, so a lower FAR wins even with a much worse FRR.
+    safe_but_annoying = cell(1, "esp32", "local", 0.0, 0.50)
+    lax_but_smooth = cell(2, "esp32", "ai", 0.25, 0.0)
+    ranked = rank_cells([lax_but_smooth, safe_but_annoying])
+    check("lower FAR wins even with a far worse FRR",
+          ranked[0] is safe_but_annoying, f"first={ranked[0].label}")
+
+    # Retry only breaks a FAR+FRR tie -- it is friction, not an error.
+    smooth = cell(3, "webcam", "local", 0.0, 0.0, retry=0.05)
+    retrying = cell(1, "esp32", "local", 0.0, 0.0, retry=0.60)
+    ranked = rank_cells([retrying, smooth])
+    check("retry rate breaks a FAR+FRR tie", ranked[0] is smooth,
+          f"first={ranked[0].label}")
+
+    # An exact tie must go to local: identical safety for no latency, no
+    # network dependency and no money.
+    loc = cell(3, "webcam", "local", 0.0, 0.0)
+    ai = cell(4, "webcam", "ai", 0.0, 0.0)
+    check("an exact tie goes to the local backend",
+          rank_cells([ai, loc])[0] is loc)
+
+    # A missing rate must never masquerade as a good one.
+    unknown = cell(4, "webcam", "ai", 0.0, None)
+    known = cell(3, "webcam", "local", 0.0, 0.90)
+    check("an unknown FRR ranks below a known bad one",
+          rank_cells([unknown, known])[0] is known,
+          f"first={rank_cells([unknown, known])[0].label}")
+
+    # Full four-way order, the way it will actually be read.
+    cells = [cell(1, "esp32", "local", 0.50, 0.25),
+             cell(2, "esp32", "ai", 0.25, 0.25),
+             cell(3, "webcam", "local", 0.0, 0.0),
+             cell(4, "webcam", "ai", 0.0, 0.25)]
+    order = [c.test_no for c in rank_cells(cells)]
+    check("four-way ranking is 3,4,2,1", order == [3, 4, 2, 1], str(order))
+
+
+# ═════════════════════════════════════════════════════════════════
+# CART LEDGER + LANE: the running bill, and weight-driven removal
+# ═════════════════════════════════════════════════════════════════
+
+def test_cart_ledger():
+    print("\n[cart] ledger keeps quantities, per-unit weights and a bill")
+    from ml.cart import CartFlag, CartLedger
+
+    seen = []
+    led = CartLedger(prices={"soap": 35.0, "gel": 120.0},
+                     on_event=lambda e: seen.append(e))
+    led.add_unit("soap", 150.0, "T1")
+    led.add_unit("soap", 152.0, "T2")
+    led.add_unit("gel", 150.0, "T3")
+    check("quantities count units per SKU",
+          led.quantities() == {"soap": 2, "gel": 1}, str(led.quantities()))
+    check("subtotal is price x qty", led.subtotal() == 190.0,
+          str(led.subtotal()))
+    check("every mutation emitted an event", len(seen) == 3, str(len(seen)))
+
+    # Removing by weight takes the unit whose recorded weight is closest, so
+    # the line that physically left is the one de-billed.
+    ev = led.remove_unit("soap", weight_g=152.0)
+    check("remove_unit returns a remove event",
+          ev is not None and ev.kind == "remove" and ev.qty_delta == -1,
+          str(ev))
+    check("removal lowers quantity and bill",
+          led.quantities() == {"soap": 1, "gel": 1} and led.subtotal() == 155.0,
+          f"{led.quantities()} {led.subtotal()}")
+
+    # A SKU that is not in the cart cannot be removed -> None, so the caller
+    # flags rather than silently doing nothing.
+    check("removing an absent SKU returns None",
+          led.remove_unit("not_in_cart") is None, "expected None")
+
+    # An unpriced SKU still counts as a quantity; it just can't be billed.
+    led.add_unit("mystery", 90.0)
+    check("unpriced SKU counted but not billed",
+          led.quantities().get("mystery") == 1 and led.subtotal() == 155.0,
+          f"{led.quantities()} {led.subtotal()}")
+    check("unpriced lines are reported", led.has_unpriced(), "expected True")
+
+    f = led.flag(CartFlag.SWAP_SUSPECT, "swap!", sku="soap")
+    check("a flag changes no quantity",
+          f.qty_delta == 0 and led.quantities().get("soap") == 1, str(f))
+
+
+class _PerSkuRecognizer:
+    """
+    Scores by REAL cosine against distinct per-SKU unit vectors, so exactly one
+    candidate wins.  `seen` names which SKU the crops actually show.
+    """
+
+    def __init__(self, vec) -> None:
+        self.vec = vec
+
+    def embed(self, crop):
+        return self.vec
+
+    def similarity(self, a, b):
+        return float(np.dot(a, b))
+
+
+_SKU_VECS = {
+    "soap": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+    "gel":  np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+    "rice": np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32),
+}
+
+
+def _verifier_seeing(sku: str):
+    """A real ProductVerifier whose crops look like `sku` and nothing else."""
+    appearance_db = {k: [v] for k, v in _SKU_VECS.items()}
+    colour_db = {k: ColourReference([np.array([1.0], dtype=np.float32)])
+                 for k in _SKU_VECS}
+    return ProductVerifier(
+        _PerSkuRecognizer(_SKU_VECS[sku]), appearance_db=appearance_db,
+        colour_db=colour_db,
+        colour_hist_fn=lambda c: np.array([1.0], dtype=np.float32))
+
+
+def test_classify_closed_set():
+    print("\n[verifier] classify() picks among cart SKUs, or refuses")
+    crops = [_usable_crop() for _ in range(4)]
+
+    # The crops show 'gel'; among gel/soap it must pick gel, confidently.
+    r = _verifier_seeing("gel").classify(crops, ["soap", "gel"])
+    check("picks the SKU the crops actually show",
+          r.best_sku == "gel", str(r.best_sku))
+    check("confident when the winner is clear and above threshold",
+          r.confident, f"{r.best_score} margin={r.margin}")
+    check("runner-up is reported for auditability",
+          r.runner_up == "soap", str(r.runner_up))
+
+    # A candidate list that excludes the true item must NOT be confident: the
+    # best remaining score is far below the appearance threshold.
+    r = _verifier_seeing("gel").classify(crops, ["soap", "rice"])
+    check("not confident when no candidate matches", not r.confident,
+          f"{r.best_sku} {r.best_score}")
+
+    # No usable crops -> cannot judge, never a confident guess.
+    r = _verifier_seeing("gel").classify([], ["soap", "gel"])
+    check("no crops -> not confident and no pick",
+          not r.confident and r.best_sku is None, str(r))
+
+    # A candidate with no references is skipped rather than scored as 0.
+    r = _verifier_seeing("gel").classify(crops, ["gel", "no_such_sku"])
+    check("candidates without references are skipped",
+          [s for s, _ in r.ranked] == ["gel"], str(r.ranked))
+
+    # The margin rule: an impossibly large margin requirement must defeat
+    # confidence even though the top score is high.
+    r = _verifier_seeing("gel").classify(crops, ["soap", "gel"], margin=99.0)
+    check("an unmet margin blocks confidence", not r.confident,
+          f"margin={r.margin}")
+
+
+def _lane(verifier, prices=None, barcode=None, weight=None, detector=None):
+    from ml.lane import LaneController
+    return LaneController(verifier=verifier, barcode=barcode, weight=weight,
+                          detector=detector, prices=prices or {},
+                          frame_size=(FRAME_W, FRAME_H))
+
+
+def test_lane_add_path():
+    print("\n[lane] a MATCH adds to the cart; a flagged verdict does not")
+    from ml.cart import CartFlag
+    from ml.detector import OracleDetector
+    from ml.events import MockBarcodeSource, MockWeightSource
+
+    frame = _frame()
+    xs = _transit_xs()
+
+    def run(verifier, sku, grams=150.0):
+        det = OracleDetector()
+        bc = MockBarcodeSource()
+        wt = MockWeightSource()
+        lane = _lane(verifier, prices={"soap": 35.0, "gel": 120.0},
+                     barcode=bc, weight=wt, detector=det)
+        bc.scan(sku, txn_id="T-1")
+        evs, seq = [], 0
+        for x in xs:
+            det.set([_det(x)]); evs += lane.process(frame, _meta(seq)); seq += 1
+        wt.begin_change()
+        det.set([_det(xs[-1])]); evs += lane.process(frame, _meta(seq)); seq += 1
+        wt.settle(grams, txn_id="T-1")
+        det.set([_det(xs[-1])]); evs += lane.process(frame, _meta(seq)); seq += 1
+        return lane, evs
+
+    # Genuine: the crops show the scanned SKU -> MATCH -> cart +1, bill up.
+    lane, evs = run(_verifier_seeing("soap"), "soap")
+    adds = [e for e in evs if e.kind == "add"]
+    check("MATCH produces exactly one add event", len(adds) == 1, str(evs))
+    check("add carries the SKU and the settled weight",
+          adds and adds[0].sku == "soap" and adds[0].weight_g == 150.0,
+          str(adds))
+    check("cart and bill reflect the add",
+          lane.ledger.quantities() == {"soap": 1}
+          and lane.ledger.subtotal() == 35.0,
+          f"{lane.ledger.quantities()} {lane.ledger.subtotal()}")
+
+    # THE ATTACK: scan 'soap' but present 'gel' (same 150 g).  Weight is happy;
+    # the camera must refuse, and the cart must NOT grow.
+    lane, evs = run(_verifier_seeing("gel"), "soap")
+    flags = [e for e in evs if e.kind == "flag"]
+    check("same-weight swap is flagged, not added",
+          len(flags) == 1 and not [e for e in evs if e.kind == "add"],
+          str(evs))
+    check("swap flag is a mismatch/suspect kind",
+          flags and flags[0].flag in (CartFlag.MISMATCH, CartFlag.SWAP_SUSPECT),
+          str(flags))
+    check("cart stays empty after a swap attempt",
+          lane.ledger.quantities() == {} and lane.ledger.subtotal() == 0.0,
+          str(lane.ledger.quantities()))
+
+    # A SKU with no references cannot be judged -> UNAVAILABLE flag, no add.
+    lane, evs = run(_verifier_seeing("soap"), "no_such_sku")
+    flags = [e for e in evs if e.kind == "flag"]
+    check("unknown SKU -> UNAVAILABLE flag, never an add",
+          flags and flags[0].flag == CartFlag.UNAVAILABLE
+          and lane.ledger.is_empty(), str(evs))
+
+
+def test_lane_removal_paths():
+    print("\n[lane] a weight DROP removes; ambiguity is flagged, never guessed")
+    from ml.cart import CartFlag
+    from ml.detector import OracleDetector
+    from ml.events import MockWeightSource
+
+    frame = _frame()
+
+    def build(seeing, units, seq0=0):
+        det = OracleDetector()
+        wt = MockWeightSource()
+        lane = _lane(_verifier_seeing(seeing), prices={"soap": 35.0,
+                                                       "gel": 120.0},
+                     weight=wt, detector=det)
+        for sku, g in units:
+            lane.ledger.add_unit(sku, g)
+        # Let the leaving-item buffer fill with crops of the moving item.
+        seq = seq0
+        for _ in range(6):
+            det.set([_det(300)]); lane.process(frame, _meta(seq)); seq += 1
+        return lane, det, wt, seq
+
+    # ONE cart line matches the drop -> straight removal, bill down.
+    lane, det, wt, seq = build("soap", [("soap", 150.0)])
+    wt.settle(-150.0)
+    det.set([_det(300)]); evs = lane.process(frame, _meta(seq))
+    check("a matching weight drop removes the item",
+          len(evs) == 1 and evs[0].kind == "remove" and evs[0].sku == "soap",
+          str(evs))
+    check("removal empties the cart and the bill",
+          lane.ledger.is_empty() and lane.ledger.subtotal() == 0.0,
+          f"{lane.ledger.quantities()} {lane.ledger.subtotal()}")
+
+    # A drop matching NOTHING in the cart -> flagged for review, no change.
+    lane, det, wt, seq = build("soap", [("soap", 150.0)], seq0=100)
+    wt.settle(-900.0)
+    det.set([_det(300)]); evs = lane.process(frame, _meta(seq))
+    check("an unexplained drop is flagged",
+          evs and evs[0].flag == CartFlag.UNEXPECTED_REMOVAL, str(evs))
+    check("an unexplained drop changes nothing",
+          lane.ledger.quantities() == {"soap": 1},
+          str(lane.ledger.quantities()))
+
+    # TWO cart lines share the drop weight and the camera CAN tell which left.
+    lane, det, wt, seq = build("gel", [("soap", 150.0), ("gel", 150.0)],
+                               seq0=200)
+    wt.settle(-150.0)
+    det.set([_det(300)]); evs = lane.process(frame, _meta(seq))
+    check("camera disambiguates same-weight lines",
+          evs and evs[0].kind == "remove" and evs[0].sku == "gel", str(evs))
+    check("the OTHER same-weight line is untouched",
+          lane.ledger.quantities() == {"soap": 1},
+          str(lane.ledger.quantities()))
+
+    # Same setup but the camera has NO crops to judge -> must flag, not guess.
+    det2 = OracleDetector()
+    wt2 = MockWeightSource()
+    lane2 = _lane(_verifier_seeing("gel"), prices={}, weight=wt2,
+                  detector=det2)
+    lane2.ledger.add_unit("soap", 150.0)
+    lane2.ledger.add_unit("gel", 150.0)
+    wt2.settle(-150.0)
+    det2.set([])
+    evs = lane2.process(frame, _meta(300))
+    check("no view of the leaving item -> AMBIGUOUS_REMOVAL",
+          evs and evs[0].flag == CartFlag.AMBIGUOUS_REMOVAL, str(evs))
+    check("ambiguous removal de-bills nothing",
+          lane2.ledger.quantities() == {"soap": 1, "gel": 1},
+          str(lane2.ledger.quantities()))
+
+    # Weight uniquely implies 'soap', but the camera confidently saw 'gel'
+    # leaving: a contradiction must be held for review, not resolved by weight.
+    lane3, det3, wt3, seq3 = build("gel", [("soap", 150.0), ("gel", 900.0)],
+                                   seq0=400)
+    wt3.settle(-150.0)
+    det3.set([_det(300)]); evs = lane3.process(frame, _meta(seq3))
+    check("weight/camera contradiction is flagged",
+          evs and evs[0].flag == CartFlag.REMOVAL_MISMATCH, str(evs))
+    check("contradiction de-bills nothing",
+          lane3.ledger.quantities() == {"soap": 1, "gel": 1},
+          str(lane3.ledger.quantities()))
+
+    # Scale noise below the floor must not look like a removal at all.
+    lane4, det4, wt4, seq4 = build("soap", [("soap", 150.0)], seq0=500)
+    wt4.settle(-1.0)
+    det4.set([_det(300)]); evs = lane4.process(frame, _meta(seq4))
+    check("tiny negative noise is not a removal",
+          not [e for e in evs if e.kind == "remove"], str(evs))
+
+
+class _CountingDetector:
+    """Wraps OracleDetector and counts detect() calls per frame."""
+
+    def __init__(self, inner) -> None:
+        self.inner = inner
+        self.calls = 0
+
+    def set(self, dets):
+        self.inner.set(dets)
+
+    def detect(self, frame):
+        self.calls += 1
+        return self.inner.detect(frame)
+
+    def reset(self):
+        self.inner.reset()
+
+    def background_image(self):
+        return None
+
+
+def test_lane_single_detect_per_frame():
+    print("\n[lane] the detector runs ONCE per frame (Pi budget)")
+    from ml.detector import OracleDetector
+    from ml.events import MockBarcodeSource, MockWeightSource
+
+    inner = OracleDetector()
+    det = _CountingDetector(inner)
+    bc = MockBarcodeSource()
+    wt = MockWeightSource()
+    lane = _lane(_verifier_seeing("soap"), barcode=bc, weight=wt, detector=det)
+    bc.scan("soap", txn_id="T-1")
+
+    frame = _frame()
+    frames = 7
+    for seq in range(frames):
+        det.set([_det(40 + seq * 50)])
+        lane.process(frame, _meta(seq))
+    check("one detect() per process() call despite two consumers",
+          det.calls == frames, f"{det.calls} calls for {frames} frames")
+
+
+def main():
+    print("=" * 60)
+    print("  NXTCart-Cam — headless verification branch coverage")
+    print("  (logic only; no camera, no model, no reference photos)")
+    print("=" * 60)
+
+    test_verifier_truth_table()
+    test_verifier_joint_pass_required()
+    test_only_match_accepts()
+    test_colour_low_saturation()
+    test_product_crop()
+    test_follower_lock_and_reach()
+    test_follower_waits_when_scanner_crowded()
+    test_follower_ambiguous()
+    test_follower_merged()
+    test_follower_lost()
+    test_follower_seq_dedupe()
+    test_custody_gating_and_flow()
+    test_txn_id_and_weight_binding()
+    test_backend_protocol()
+    test_ai_verdict_mapping()
+    test_ai_fails_closed()
+    test_ai_reply_parsing()
+    test_comparison_metrics()
+    test_bakeoff_ranking()
+    test_cart_ledger()
+    test_classify_closed_set()
+    test_lane_add_path()
+    test_lane_removal_paths()
+    test_lane_single_detect_per_frame()
+
+    print("\n" + "=" * 60)
+    if _failures:
+        print(f"  {len(_failures)} CHECK(S) FAILED: {_failures}")
+        print("=" * 60)
+        sys.exit(1)
+    print("  ALL CHECKS PASSED")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
