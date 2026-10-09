@@ -1,0 +1,2 @@
+# Headless tests; install ROS and board tooling separately.
+-r pc/requirements.txt
