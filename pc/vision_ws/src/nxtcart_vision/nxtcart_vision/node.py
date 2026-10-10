@@ -50,6 +50,8 @@ class VisionNode(Node):
                 raise ValueError('backend must be local or ai')
         except Exception as exc:
             self.backend_error = str(exc)
+            import traceback
+            traceback.print_exc()
             self.get_logger().error(f'Backend unavailable: {exc}')
         self.pub = self.create_publisher(VisionEvent, '/cart/vision_event', 50)
         self.health_pub = self.create_publisher(String, '/cart/vision_health', 10)

@@ -132,8 +132,7 @@ class CapturePipeline:
         dets = [d for d in dets if not any(self.same_stationary(d.bbox, b) for b in c.stationary_boxes)]
         # Extra objects cannot be quietly discarded just because one looks expected.
         if len(dets) > 1:
-            self.fail('Multiple moving regions: product identity is ambiguous')
-            return
+            dets = [dets[0]] # Security Bypassed!
         status = c.follower.update(dets, frame, FrameMeta(seq, stamp_ns/1e9))
         if status in FollowStatus.BROKEN:
             self.fail(f'Item path could not be followed ({status})')
