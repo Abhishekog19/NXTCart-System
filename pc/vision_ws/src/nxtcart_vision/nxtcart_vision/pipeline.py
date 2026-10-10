@@ -1,6 +1,7 @@
 """Continuous custody capture, independent of ROS and inference latency."""
 import math
 import time
+import numpy as np
 from dataclasses import dataclass, field
 from ml.detector import BackgroundSubtractorDetector
 from ml.frame_source import FrameMeta
@@ -29,13 +30,19 @@ class CapturePipeline:
     def __init__(self, on_failure, on_crops, scanner_region=(0., 0., .45, 1.),
                  cart_region=(.55, 0., 1., 1.), clock=time.monotonic,
                  detector=None, follower_factory=ItemFollower, timeout=12.,
-                 max_gap_sec=.35, still_frames=4, still_pixels=8., on_anomaly=None):
+                 max_gap_sec=.35, still_frames=4, still_pixels=8., on_anomaly=None,
+                 scene_region=(0., 0., 1., 1.)):
         self.on_failure, self.on_crops = on_failure, on_crops
         self.clock, self.detector, self.follower_factory = clock, detector or BackgroundSubtractorDetector(), follower_factory
         self.scanner_region, self.cart_region = scanner_region, cart_region
-        for box in (scanner_region, cart_region):
+        self.scene_region = scene_region
+        for box in (scanner_region, cart_region, scene_region):
             if len(box) != 4 or not all(math.isfinite(x) and 0 <= x <= 1 for x in box) or box[0] >= box[2] or box[1] >= box[3]:
                 raise ValueError('regions must be normalized left,top,right,bottom boxes')
+        for box in (scanner_region, cart_region):
+            if not (scene_region[0] <= box[0] and scene_region[1] <= box[1]
+                    and box[2] <= scene_region[2] and box[3] <= scene_region[3]):
+                raise ValueError('scene_region must contain the complete scanner and cart regions')
         self.timeout, self.max_gap_sec, self.still_frames, self.still_pixels = timeout, max_gap_sec, still_frames, still_pixels
         self.active = None
         self.stream, self.seq, self.stamp_ns, self.last_frame_at = None, -1, 0, -math.inf
@@ -45,6 +52,8 @@ class CapturePipeline:
         self.on_anomaly = on_anomaly
         self.idle_cart_boxes = None
         self.idle_changed = False
+        self.last_status, self.last_reason = 'IDLE', ''
+        self.last_target, self.last_area_ratio = None, 1.0
 
     @property
     def ready(self):
@@ -63,6 +72,7 @@ class CapturePipeline:
         f._scanner_box = _region_px(start, w, h)
         f._cart_box = _region_px(end, w, h)
         self.active = Capture(txn_id, attempt, sku, barcode, started_ns, self.clock(), f, action)
+        self.last_status, self.last_reason = 'WAITING', ''
         # Ignore previously stationary contents, never a moving target or a new region.
         self.active.stationary_boxes = tuple(d.bbox for d in self.last_detections
             if self.inside(d.centroid, self.cart_region))
@@ -84,6 +94,7 @@ class CapturePipeline:
     def fail(self, reason):
         active, self.active = self.active, None
         if active:
+            self.last_status, self.last_reason = 'RETRY', reason
             self.on_failure(active, reason)
 
     def frame(self, stream, seq, stamp_ns, frame):
@@ -109,7 +120,17 @@ class CapturePipeline:
             self.frame_size = frame.shape[1::-1]
             self.detector.reset()
         self.stream, self.seq, self.stamp_ns, self.last_frame_at = stream, seq, stamp_ns, now
-        dets = self.detector.detect(frame)
+        # Mask motion outside the calibrated cart view BEFORE connected regions
+        # are built, so an outside arm cannot join the product's silhouette.
+        w, h = self.frame_size
+        left, top, right, bottom = [int(v*s) for v, s in zip(self.scene_region, (w, h, w, h))]
+        detector_frame = frame
+        if tuple(self.scene_region) != (0., 0., 1., 1.):
+            detector_frame = np.zeros_like(frame)
+            detector_frame[top:bottom, left:right] = frame[top:bottom, left:right]
+        dets = [d for d in self.detector.detect(detector_frame)
+                if d.bbox[0] < right and d.bbox[1] < bottom
+                and d.bbox[0]+d.bbox[2] > left and d.bbox[1]+d.bbox[3] > top]
         self.last_detections = dets
         c = self.active
         if not c:
@@ -132,11 +153,14 @@ class CapturePipeline:
         dets = [d for d in dets if not any(self.same_stationary(d.bbox, b) for b in c.stationary_boxes)]
         # Extra objects cannot be quietly discarded just because one looks expected.
         if len(dets) > 1:
-            self.fail('Multiple moving regions: product identity is ambiguous')
+            self.fail(f'Multiple moving regions ({len(dets)}) inside the calibrated view: product identity is ambiguous')
             return
         status = c.follower.update(dets, frame, FrameMeta(seq, stamp_ns/1e9))
+        self.last_status = status
+        self.last_target = c.follower.target_bbox
+        self.last_area_ratio = c.follower.area_ratio
         if status in FollowStatus.BROKEN:
-            self.fail(f'Item path could not be followed ({status})')
+            self.fail(f'Item path could not be followed ({status}): {c.follower.failure_reason}')
             return
         bbox = c.follower.target_bbox
         if bbox and status == FollowStatus.REACHED_CART and c.follower.observed_seq == seq:
@@ -155,6 +179,7 @@ class CapturePipeline:
             c.rest_crops.clear()
         if c.settled_ns and stamp_ns >= c.settled_ns and c.still >= self.still_frames and len(c.rest_crops) == 3:
             self.active = None
+            self.last_status = 'CHECKING_IMAGES'
             # Explicit final three views come from observed, clear resting frames.
             # Earlier views stay distinct; they cannot vote as resting evidence.
             earlier = c.follower.crops_before(c.rest_crops[0].seq)

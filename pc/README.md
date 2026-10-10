@@ -22,3 +22,5 @@ utilities. Their experimental cart logic is not launched by the ROS service.
 `legacy/test_cart_logic.py` targets an earlier Pi contract and is excluded from
 the current runner. Historical documents are in `docs/`; the authoritative
 integrated workflow is [../docs/SYSTEM_SETUP.md](../docs/SYSTEM_SETUP.md).
+
+For repeated `MERGED` or multiple-region retries, use the [tracking calibration guide](../docs/TRACKING_CALIBRATION.md).

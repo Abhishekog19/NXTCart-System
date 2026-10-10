@@ -26,12 +26,16 @@ class VisionNode(Node):
                     'backend': 'local', 'ai_model': '', 'ai_base_url': '',
                     'ai_timeout': 8.0, 'capture_timeout': 12.0, 'result_timeout': 18.0,
                     'max_inflight': 8, 'scanner_region': [0., 0., .45, 1.],
-                    'cart_region': [.55, 0., 1., 1.], 'preview': False}
+                    'cart_region': [.55, 0., 1., 1.], 'scene_region': [0., 0., 1., 1.],
+                    'merge_area_ratio': 1.35, 'preview': False}
         for name, value in defaults.items():
             self.declare_parameter(name, value)
         p = lambda name: self.get_parameter(name).value
         root = Path(p('cam_root')).resolve(); sys.path.insert(0, str(root))
         from .pipeline import CapturePipeline
+        from ml.item_follower import ItemFollower
+        # Reject invalid calibration at startup, before a scan callback can fail.
+        ItemFollower((640, 480), merge_area_ratio=p('merge_area_ratio'))
         self.backend, self.backend_error = None, ''
         try:
             if p('backend') == 'local':
@@ -60,7 +64,8 @@ class VisionNode(Node):
         self.early_settles = {}
         self.pipeline = CapturePipeline(self.failure, self.submit,
             scanner_region=p('scanner_region'), cart_region=p('cart_region'), timeout=p('capture_timeout'),
-            on_anomaly=self.anomaly)
+            on_anomaly=self.anomaly, scene_region=p('scene_region'),
+            follower_factory=lambda size: ItemFollower(size, merge_area_ratio=p('merge_area_ratio')))
         self.create_subscription(VerificationRequest, '/cart/verification_request', self.request, 50)
         self.create_subscription(VerificationRequest, '/cart/placement_settled', self.settled, 50)
         self.create_subscription(CameraFrame, '/cart/camera/frame', self.frame, qos_profile_sensor_data)
@@ -111,15 +116,35 @@ class VisionNode(Node):
             self.pipeline.fail('Invalid verification camera image'); return
         self.pipeline.frame(msg.stream_id, msg.seq, ns(msg.stamp), frame)
         if self.get_parameter('preview').value:
-            for region, color in [(self.pipeline.scanner_region, (0, 180, 255)),
+            for region, color in [(self.pipeline.scene_region, (255, 150, 0)),
+                                  (self.pipeline.scanner_region, (0, 180, 255)),
                                   (self.pipeline.cart_region, (0, 180, 0))]:
                 h, w = frame.shape[:2]
                 x1, y1, x2, y2 = [int(v*s) for v, s in zip(region, (w, h, w, h))]
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.imshow('PC verification geometry: amber scan, green rest', frame)
+            for index, det in enumerate(self.pipeline.last_detections):
+                x, y, w, h = det.bbox
+                cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 255, 0), 1)
+                area = det.foreground_area if det.foreground_area is not None else det.area
+                cv2.putText(frame, f'{index+1}: {area}px', (x, max(y-5, 14)),
+                            cv2.FONT_HERSHEY_SIMPLEX, .4, (255, 255, 0), 1)
+            if self.pipeline.last_target:
+                x, y, w, h = self.pipeline.last_target
+                cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 0, 255), 2)
+            label = f'{self.pipeline.last_status} | regions={len(self.pipeline.last_detections)} | area={self.pipeline.last_area_ratio:.2f}x'
+            cv2.putText(frame, label, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, .45, (255, 255, 255), 1)
+            cv2.imshow('PC verification: blue view, amber scan, green rest, magenta target', frame)
+            mask = self.pipeline.detector.last_fg_mask
+            if mask is not None:
+                cv2.imshow('PC foreground: white regions are motion, not identified products', mask)
             cv2.waitKey(1)
 
     def failure(self, capture, reason):
+        boxes = [{'box': list(d.bbox), 'foreground_px': d.foreground_area}
+                 for d in self.pipeline.last_detections]
+        self.get_logger().info('Tracking evidence: ' + json.dumps({
+            'txn_id': capture.txn_id, 'regions': boxes, 'scene_region': self.pipeline.scene_region,
+            'area_ratio': self.pipeline.last_area_ratio}))
         self.publish(capture, 'RETRY', reason)
 
     def anomaly(self, reason):

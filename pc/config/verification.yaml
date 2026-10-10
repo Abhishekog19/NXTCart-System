@@ -1,0 +1,10 @@
+# Calibrate on the PC using preview:=true. Coordinates are normalized L,T,R,B.
+# Include the ENTIRE path and basket; never hide a place where goods can enter.
+pc_product_verifier:
+  ros__parameters:
+    scene_region: [0.0, 0.0, 1.0, 1.0]
+    scanner_region: [0.0, 0.0, 0.45, 1.0]
+    cart_region: [0.55, 0.0, 1.0, 1.0]
+    # Actual foreground area is used when the detector provides a mask.
+    # Leave this guard unchanged until genuine placements AND swaps are tested.
+    merge_area_ratio: 1.35
