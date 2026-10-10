@@ -1,4 +1,5 @@
 string txn_id
+string scan_id
 uint32 attempt
 string barcode
 string sku

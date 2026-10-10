@@ -6,13 +6,14 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from smart_cart_interfaces.msg import CameraFrame
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge, CvBridgeError
 
 
 class ReferenceCapture(Node):
     def __init__(self):
         super().__init__('reference_capture')
-        self.declare_parameter('cam_root', os.environ.get('NXTCART_CAM_PATH', os.path.expanduser('~/NXTCart/pc')))
+        self.declare_parameter('cam_root', os.environ.get('NXTCART_CAM_PATH', os.path.expanduser('~/NXTCart-System/pc')))
         self.declare_parameter('sku', '')
         sku = self.get_parameter('sku').value
         if not sku or sku in ('.', '..') or any(c in sku for c in '/\\'):
@@ -20,13 +21,18 @@ class ReferenceCapture(Node):
         self.folder = Path(self.get_parameter('cam_root').value)/'references'/sku
         self.folder.mkdir(parents=True, exist_ok=True)
         self.frame, self.seq, self.saved_seq = None, None, None
-        self.create_subscription(CameraFrame, '/cart/camera/frame', self.receive, qos_profile_sensor_data)
+        self.bridge = CvBridge()
+        self.create_subscription(Image, '/cart/camera/frame', self.receive, qos_profile_sensor_data)
         self.create_timer(.03, self.tick)
         self.get_logger().info('Empty cart. Hold ONE product, varied angles. SPACE: save; Q: exit.')
 
     def receive(self, msg):
-        self.frame = cv2.imdecode(np.frombuffer(bytes(msg.jpeg), dtype=np.uint8), cv2.IMREAD_COLOR)
-        self.seq = (msg.stream_id, msg.seq)
+        try:
+            self.frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except CvBridgeError as exc:
+            self.get_logger().error(f'Invalid reference image: {exc}')
+            return
+        self.seq = (msg.header.frame_id, msg.header.stamp.sec, msg.header.stamp.nanosec)
 
     def tick(self):
         if self.frame is None:

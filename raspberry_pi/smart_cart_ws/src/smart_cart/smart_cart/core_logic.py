@@ -79,6 +79,21 @@ class CartVerificationEngine(Node):
         self.flush_commands(); self.publish_cart_state()
 
     def vision_cb(self, msg):
+        if msg.scan_id:
+            if msg.action == 'item_removed' and not msg.txn_id:
+                # Unscanned motion identifies a possible removed SKU, but image
+                # motion alone cannot authorize reducing the customer's bill.
+                self.ledger.observation_gap('Unscanned removal candidate: ' + (msg.name or 'unknown product') + '; reconcile basket contents')
+                self.publish_cart_state()
+                return
+            unit = next((u for u in self.ledger.units if
+                (u.txn_id == msg.txn_id if msg.txn_id else u.scan_id == msg.scan_id)), None)
+            if unit is None or msg.barcode != unit.barcode:
+                return
+            self.ledger.vision(unit.txn_id, msg.attempt, unit.sku, msg.verdict,
+                               msg.approved, msg.reason, msg.action)
+            self.flush_commands(); self.publish_cart_state()
+            return
         self.ledger.vision(msg.txn_id, msg.attempt, msg.name, msg.verdict,
                            msg.verified, msg.reason, msg.action)
         self.flush_commands(); self.publish_cart_state()
@@ -129,6 +144,7 @@ class CartVerificationEngine(Node):
                 self.expect_pub.publish(msg)
                 continue
             msg = VerificationRequest()
+            msg.scan_id = u.scan_id
             msg.txn_id, msg.attempt, msg.barcode, msg.sku = u.txn_id, u.attempt, u.barcode, u.sku
             msg.action = 'cancel' if kind == 'cancel' else u.action
             msg.started_at = (self.last_weight_stamp if kind == 'settled' and self.last_weight_stamp

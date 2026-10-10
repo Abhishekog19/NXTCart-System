@@ -1,24 +1,26 @@
-"""Opposite USB webcam: compress and transport frames, with no ML on the Pi."""
+"""Opposite USB webcam: sensor_msgs/Image transport, with no ML on the Pi."""
 import time
 import uuid
 import cv2
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from smart_cart_interfaces.msg import CameraFrame
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
 
 
 class CameraStreamNode(Node):
     def __init__(self):
         super().__init__('verification_camera')
         for name, value in {'camera_source': '/dev/video2', 'fps': 15.0, 'width': 640,
-                            'height': 480, 'jpeg_quality': 80}.items():
+                            'height': 480}.items():
             self.declare_parameter(name, value)
         src = str(self.get_parameter('camera_source').value)
         self.source = int(src) if src.isdigit() else src
         self.cap, self.last_open, self.seq = None, -100.0, 0
         self.stream_id = uuid.uuid4().hex
-        self.pub = self.create_publisher(CameraFrame, '/cart/camera/frame', qos_profile_sensor_data)
+        self.bridge = CvBridge()
+        self.pub = self.create_publisher(Image, '/cart/camera/frame', qos_profile_sensor_data)
         fps = float(self.get_parameter('fps').value)
         if not 5 <= fps <= 30:
             raise ValueError('fps must be between 5 and 30')
@@ -39,12 +41,10 @@ class CameraStreamNode(Node):
         if not ok:
             self.cap.release(); return
         self.seq += 1
-        ok, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY,
-                               self.get_parameter('jpeg_quality').value])
-        if ok:
-            msg = CameraFrame(); msg.stream_id = self.stream_id; msg.seq = self.seq
-            msg.stamp, msg.jpeg = stamp, jpeg.tobytes()
-            self.pub.publish(msg)
+        msg = self.bridge.cv2_to_imgmsg(frame, encoding='bgr8')
+        msg.header.stamp = stamp
+        msg.header.frame_id = 'verification_camera/' + self.stream_id
+        self.pub.publish(msg)
 
     def destroy_node(self):
         if self.cap:

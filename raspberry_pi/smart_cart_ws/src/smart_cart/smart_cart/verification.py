@@ -31,6 +31,7 @@ class Unit:
     attempt: int = 1
     arduino_status: str = 'PENDING'
     awaiting_weight: bool = True
+    scan_id: str = ''
 
     @property
     def status(self):
@@ -138,6 +139,7 @@ class VerificationLedger:
         u = Unit(uuid.uuid4().hex, product.barcode, product.name, product.sku,
                  product.expected_weight, product.price, product.tolerance_g, self.clock())
         self.units.append(u)
+        u.scan_id = scan_id
         if not self.sensor_ok or not self.ready:
             u.weight_status = 'FAIL'
             u.awaiting_weight = False
