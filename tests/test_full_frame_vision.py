@@ -111,91 +111,148 @@ class NodeTests(unittest.TestCase):
     def setUp(self):
         stubs = adapters.ros_stubs(); self.msgs = stubs['smart_cart_interfaces.msg']
         self.stub_patch = patch.dict('sys.modules', stubs); self.stub_patch.start(); self.addCleanup(self.stub_patch.stop)
-        adapters.Node.overrides = {'cam_root':str(fixtures.ROOT/'pc'), 'min_samples':3, 'max_samples':3}
+        adapters.Node.overrides = {'cam_root':str(fixtures.ROOT/'pc')}
         self.matcher = types.SimpleNamespace(products={'sku_a':[]},
             resolve=lambda barcode,name='': 'sku_a' if barcode in ('001','sku_a') or name == '001' else None,
-            verify=lambda sku,samples: Result('MATCH', sku or 'sku_a', .9, .8, 'matched'))
+            verify=lambda sku,samples: Result('MATCH', sku, .9, .8, 'matched'))
         with patch('nxtcart_vision.local_matcher.LocalMatcher', return_value=self.matcher):
             from nxtcart_vision.vision_verify_node import VisionNode, Capture
             self.node = VisionNode(); self.Capture = Capture
         self.addCleanup(self.node.destroy_node)
         self.crop = np.ones((30,40,3),np.uint8)
-        self.node.detector = types.SimpleNamespace(ready=True, boxes=[], detect=lambda frame:[self.crop])
 
-    def feed(self, index):
-        msg = types.SimpleNamespace(frame=self.crop, header=types.SimpleNamespace(frame_id='cam',
-            stamp=types.SimpleNamespace(sec=100, nanosec=index)))
+    def message(self, **kwargs):
+        values = dict(txn_id='txn', scan_id='scan-a', sku='sku_a', barcode='001', attempt=1, action='add')
+        values.update(kwargs)
+        return self.msgs.VerificationRequest(**values)
+
+    def feed(self, index, generation='cam'):
+        msg = types.SimpleNamespace(frame=self.crop, header=types.SimpleNamespace(frame_id=generation,
+            stamp=types.SimpleNamespace(sec=99, nanosec=index)))
         self.node.frame(msg)
 
-    def test_scan_sends_three_frames_to_local_model_without_weight_topic(self):
-        self.node.scan(self.msgs.ScannedItem(barcode='001', scan_id='scan-a'))
-        for i in range(1,4):
-            self.node.active.last_sample = -float('inf'); self.feed(i)
-        future = self.node.jobs[('scan-a',1)][1]; future.result(timeout=2.)
+    def finish(self):
+        for c,f,s,e in self.node.jobs.values(): f.result(timeout=2.)
         self.node.tick()
+
+    def test_static_frames_do_not_infer_until_weight_settles(self):
+        self.node.scan(self.msgs.ScannedItem(barcode='001', scan_id='scan-a'))
+        self.node.request(self.message())
+        for i in range(1,8): self.feed(i)
+        self.assertFalse(self.node.jobs)
+        self.assertFalse(self.node.pub.sent)
+        self.node.settled(self.message()); self.finish()
         result = self.node.pub.sent[-1]
         self.assertTrue(result.approved)
-        self.assertEqual(result.scan_id,'scan-a')
-        self.assertEqual(result.action,'item_placed')
+        self.assertEqual(result.txn_id, 'txn')
+        self.assertEqual(result.scan_id, 'scan-a')
 
-    def test_repeated_camera_stamp_cannot_supply_second_sample(self):
-        self.node.scan(self.msgs.ScannedItem(barcode='001', scan_id='scan-a'))
-        self.feed(1); self.node.active.last_sample = -float('inf'); self.feed(1)
-        self.assertEqual(len(self.node.active.samples),1)
+    def test_repeated_camera_stamp_not_buffered(self):
+        self.feed(1); self.feed(1)
+        self.assertEqual(len(self.node.frames),1)
 
-    def test_partial_occlusion_does_not_cancel_collected_samples(self):
-        self.node.scan(self.msgs.ScannedItem(barcode='001', scan_id='scan-a'))
+    def test_no_scan_or_weight_never_generates_removal(self):
+        for i in range(1,8): self.feed(i)
+        self.node.tick()
+        self.assertFalse(self.node.jobs); self.assertFalse(self.node.pub.sent)
+
+    def test_buffer_prunes_old_frames_and_is_bounded(self):
+        with patch('nxtcart_vision.vision_verify_node.time.monotonic', return_value=10.): self.feed(1)
+        with patch('nxtcart_vision.vision_verify_node.time.monotonic', return_value=14.): self.feed(2)
+        self.assertEqual(len(self.node.frames),1)
+        for i in range(3,150): self.feed(i)
+        self.assertLessEqual(len(self.node.frames),90)
+
+    def test_settlement_can_arrive_before_request(self):
         self.feed(1)
-        self.node.detector.detect = lambda frame:[]; self.feed(2)
-        self.assertIsNotNone(self.node.active)
-        self.assertEqual(len(self.node.active.samples),1)
+        self.node.settled(self.message()); self.finish()
+        self.node.request(self.message())
+        self.assertTrue(self.node.pub.sent[-1].approved)
+        self.assertFalse(self.node.pending)
 
-    def test_duplicate_scan_id_is_not_reprocessed(self):
-        scan = self.msgs.ScannedItem(barcode='001', scan_id='scan-a')
-        self.node.scan(scan); active = self.node.active; self.node.scan(scan)
-        self.assertIs(active,self.node.active)
+    def test_duplicate_settlement_only_submits_once(self):
+        self.feed(1); self.node.settled(self.message()); self.node.settled(self.message())
+        self.assertEqual(len(self.node.jobs),1)
+        self.finish(); self.node.settled(self.message())
+        self.assertEqual(len(self.node.pub.sent),1)
 
-    def test_no_motion_expires_without_matching_or_waiting_for_weight(self):
-        self.node.scan(self.msgs.ScannedItem(barcode='001', scan_id='scan-a'))
-        self.node.active.opened -= 3.; self.node.tick()
+    def test_no_frames_is_explicit_retry(self):
+        self.node.settled(self.message())
+        self.assertEqual(self.node.pub.sent[-1].verdict,'RETRY')
+        self.assertFalse(self.node.jobs)
+
+    def test_stale_settlement_rejected(self):
+        self.feed(1)
+        self.node.settled(self.message(started_at=types.SimpleNamespace(sec=90,nanosec=0)))
         self.assertEqual(self.node.pub.sent[-1].verdict,'RETRY')
 
-    def test_unscanned_motion_emits_one_removal_candidate_per_episode(self):
-        self.node.idle_armed=True
-        for i in range(1,4):
-            if self.node.active: self.node.active.last_sample=-float('inf')
-            self.feed(i)
-        key = next(iter(self.node.jobs)); self.node.jobs[key][1].result(timeout=2.); self.node.tick()
-        self.assertEqual(self.node.pub.sent[-1].action,'item_removed')
-        self.assertEqual(self.node.pub.sent[-1].name,'sku_a')
-        self.assertEqual(self.node.pub.sent[-1].txn_id,'')
-        self.feed(4); self.assertIsNone(self.node.active)
+    def test_post_settlement_frames_are_excluded(self):
+        self.feed(1)
+        self.node.settled(self.message(started_at=types.SimpleNamespace(sec=99,nanosec=0)))
+        self.assertFalse(self.node.jobs)
 
-    def test_cancellation_suppresses_running_result(self):
-        capture=self.Capture('scan-a','sku_a','001',time.monotonic())
+    def test_samples_are_evenly_selected_and_copied(self):
+        for i in range(1,10):
+            self.crop[:]=i; self.feed(i)
+        self.crop[:]=99
+        self.node.settled(self.message())
+        capture = self.node.jobs[('txn',1)][0]
+        self.assertEqual([int(sample[0][0,0,0]) for sample in capture.samples],[1,3,5,7,9])
+        self.finish()
+
+    def test_waiting_for_weight_times_out(self):
+        self.node.request(self.message())
+        self.node.pending[('txn',1)].opened -= 19.
+        self.node.tick()
+        self.assertIn('Weight settlement',self.node.pub.sent[-1].reason)
+
+    def test_cancellation_suppresses_running_result_and_settlement(self):
+        capture=self.Capture('scan-a','sku_a','001',time.monotonic(),txn_id='txn')
         future=Future(); future.set_running_or_notify_cancel()
-        self.node.jobs[('scan-a',1)]=(capture,future,time.monotonic(),False)
-        self.node.request(self.msgs.VerificationRequest(txn_id='txn',scan_id='scan-a',attempt=1,action='cancel'))
+        self.node.jobs[('txn',1)]=(capture,future,time.monotonic(),False)
+        self.node.request(self.message(action='cancel'))
         future.set_result(Result('MATCH','sku_a',.9,.8,'match')); self.node.tick()
+        self.node.settled(self.message())
         self.assertEqual(len(self.node.pub.sent),0)
 
     def test_late_completed_future_cannot_pass(self):
-        capture=self.Capture('scan-a','sku_a','001',time.monotonic())
+        capture=self.Capture('scan-a','sku_a','001',time.monotonic(),txn_id='txn')
         future=Future(); future.set_result(Result('MATCH','sku_a',.9,.8,'match'))
-        self.node.jobs[('scan-a',1)]=(capture,future,time.monotonic()-10.,False)
+        self.node.jobs[('txn',1)]=(capture,future,time.monotonic()-10.,False)
         self.node.tick(); self.assertFalse(self.node.pub.sent[-1].approved)
 
-    def test_selected_removal_keeps_pi_transaction_identity(self):
-        self.node.request(self.msgs.VerificationRequest(txn_id='txn',scan_id='scan-a',sku='sku_a',
-            barcode='001',attempt=2,action='remove'))
-        self.assertEqual(self.node.active.txn_id,'txn')
-        self.assertEqual(self.node.active.attempt,2)
-        self.assertEqual(self.node.active.action,'item_removed')
+    def test_selected_removal_waits_for_settlement(self):
+        msg=self.message(attempt=2,action='remove')
+        self.node.request(msg); self.feed(1)
+        self.assertFalse(self.node.jobs)
+        self.node.settled(msg); self.finish()
+        self.assertEqual(self.node.pub.sent[-1].attempt,2)
+        self.assertEqual(self.node.pub.sent[-1].action,'item_removed')
+
+    def test_camera_restart_invalidates_pending_capture(self):
+        self.feed(1); self.node.request(self.message()); self.feed(2,'new-camera')
+        self.node.settled(self.message())
+        self.assertFalse(self.node.jobs)
+        self.assertEqual(self.node.pub.sent[-1].verdict,'RETRY')
 
 
 class PiScanBindingTests(unittest.TestCase):
     setUp = adapters.AdapterTests.setUp
     verified = adapters.AdapterTests.verified
+
+    def test_pi_settlement_is_transaction_bound_even_on_wrong_weight(self):
+        self.node.scan_cb(self.msgs.ScannedItem(barcode='001', scan_id='scan-a'))
+        request = self.node.vision_pub.sent[-1]
+        self.node.weight_cb(self.msgs.WeightSample(stream_id='scale', seq=2,
+            grams=250., stable=True, calibrated=True))
+        event = self.node.settled_pub.sent[-1]
+        self.assertEqual((event.txn_id,event.scan_id,event.attempt),
+                         (request.txn_id,'scan-a',1))
+        self.assertEqual(event.action,'add')
+        self.assertEqual(self.node.ledger.units[0].weight_status,'FAIL')
+        self.node.vision_cb(self.msgs.VisionEvent(scan_id=event.scan_id,txn_id=event.txn_id,
+            barcode='001',attempt=1,action='item_placed',verdict='MATCH',approved=True))
+        self.assertFalse(self.node.ledger.checkout_allowed)
 
     def test_new_scan_id_verdict_updates_pi_camera_gate_only(self):
         self.node.scan_cb(self.msgs.ScannedItem(barcode='001',scan_id='direct'))
