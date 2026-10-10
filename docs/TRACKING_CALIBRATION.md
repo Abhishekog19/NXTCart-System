@@ -1,3 +1,8 @@
+# Historical geometric tracker notes
+
+This tracker is retired. The active full-frame node has no geometric boxes or
+MERGED checks. Use [LENIENT_VISION_SETUP.md](LENIENT_VISION_SETUP.md).
+
 # Reduce false tracking retries
 
 `Multiple moving regions` and `MERGED` happen before product-reference inference.

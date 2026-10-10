@@ -1,26 +1,24 @@
-# PC image verification
+# PC full-frame image verification
 
-This folder is the PC deployment unit. `vision_ws/` receives camera frames and
-transactions through ROS 2. `ml/` tracks the image journey, selects clear crops
-and compares them against the scanned SKU's references. Cart state, prices,
-weight acceptance, QR scanning, display and checkout belong to the Pi.
+Start with [LENIENT_VISION_SETUP.md](../docs/LENIENT_VISION_SETUP.md).
+The active node is `vision_ws/src/nxtcart_vision/nxtcart_vision/vision_verify_node.py`.
+It consumes `sensor_msgs/Image` through cv_bridge and scans through ScannedItem,
+collects 3–5 motion frames without geometric tracking, and compares crops using
+local MobileNetV2 ONNX. Any matching view can approve the camera gate.
 
-Follow [the setup guide](../docs/SYSTEM_SETUP.md), then run from the repo root:
+From the repository root after rebuilding both ROS workspaces:
 
 ```bash
-bash pc/run_verifier.sh backend:=local
+bash pc/run_verifier.sh catalog_path:=/path/to/products.json preview:=true
 ```
 
-For an API choose `backend:=ai`, `ai_model` and `ai_base_url`, keeping credentials
-in the PC environment. The launcher sets `NXTCART_CAM_PATH` to this folder.
+The model and database default to `pc/ml/mobilenet_v2.onnx` and
+`pc/embedding_db.pkl` through the launcher. Catalogue mapping is optional only
+when the database already resolves scanner barcodes. Colour and apparent-size
+metadata are used when available. The Pi owns cart state, weight and checkout.
 
-References belong in `pc/references/<sku>/`. From `pc/`, run `python build_db.py`
-and `python preflight.py /path/to/products.json --backend local`.
-
-Demos and `ml/lane.py`, `ml/cart.py` and related modules are retained research
-utilities. Their experimental cart logic is not launched by the ROS service.
-`legacy/test_cart_logic.py` targets an earlier Pi contract and is excluded from
-the current runner. Historical documents are in `docs/`; the authoritative
-integrated workflow is [../docs/SYSTEM_SETUP.md](../docs/SYSTEM_SETUP.md).
-
-For repeated `MERGED` or multiple-region retries, use the [tracking calibration guide](../docs/TRACKING_CALIBRATION.md).
+Historical geometric tracking, retired tests and prior one-off patch scripts
+are retained in `legacy/`; do not apply those patches to the current node.
+AI comparison/dataset tools remain development utilities; no API is called by
+the live ROS node. Capture references in `pc/references/<sku>/` and use
+`build_db.py` from `pc/` to rebuild an ONNX-stamped database when needed.

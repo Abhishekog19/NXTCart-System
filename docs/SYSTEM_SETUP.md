@@ -1,3 +1,10 @@
+> Current vision migration: [Full-frame local ONNX setup](LENIENT_VISION_SETUP.md).
+> Rebuild both hosts. The camera now publishes sensor_msgs/Image through cv_bridge,
+> and the live PC verifier no longer uses geometric zones, continuous custody,
+> settled-weight waits, or API inference. The older vision-specific sections below
+> are retained for historical context; use the linked guide for current PC commands.
+> Hardware mounting, HX711 calibration, catalogue import and Pi checkout principles still apply.
+
 # Dual-webcam cart: setup and hardware acceptance
 
 This is the current integration guide. Earlier standalone demos and architecture
@@ -18,7 +25,7 @@ coverage. Complete the acceptance runs below on your actual cart before use.
 The Pi does **not** load models, embeddings, reference photos or API keys.
 Whole compressed verification-camera frames cross Wi-Fi so the PC can check
 continuity, ambiguous motion and rest. Sending isolated crops alone would lose
-that evidence. Cropping and all inference happen on the PC. Start at 640×480,
+that evidence. Cropping and all inference happen on the PC. Start at 640Ã—480,
 15 fps, JPEG quality 80 and measure bandwidth, frame loss and CPU on the rig.
 
 ```mermaid
@@ -229,7 +236,7 @@ ros2 run nxtcart_vision capture_references --ros-args \
 ```
 
 Hold exactly one product clearly in view. SPACE saves a distinct frame after
-the shared product-crop check; Q exits. Capture at least 8–12 varied front,
+the shared product-crop check; Q exits. Capture at least 8â€“12 varied front,
 back, side, rotation and real-distance views per SKU. Use the exact `sku` from
 `products.json`. Repeat for every sellable variant/size. Do not photograph two
 products together. Rejected references need a clearer product/background.
@@ -316,7 +323,7 @@ No paid API calls are made by the supplied headless tests. The model/provider
 choice remains open. Never assume a text-only model supports camera evidence.
 AI calls send bounded reference photos and varied live crops; errors, uncertain
 answers and malformed responses are non-accepting. API latency is not guaranteed
-at 5–6 seconds; current AI HTTP timeout is 8 seconds, capture deadline 12 seconds,
+at 5â€“6 seconds; current AI HTTP timeout is 8 seconds, capture deadline 12 seconds,
 Pi overall deadline 20 seconds, and inference queue capacity eight. Tune these
 together after measuring, with terminal timeouts retained.
 

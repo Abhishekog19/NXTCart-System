@@ -10,13 +10,13 @@ flagged items do not stop shopping, but every unit must pass before checkout.
 | --- | --- | --- |
 | [`raspberry_pi/`](raspberry_pi/) | Raspberry Pi | Both USB cameras, QR decoding, Arduino bridge, catalogue, durable cart state, touchscreen and checkout permission |
 | [`arduino/`](arduino/) | Arduino | HX711 measurements, calibration, stability and expected-weight checks |
-| [`pc/`](pc/) | PC | Image tracking, crops and verification using local ML or a configurable vision API |
+| [`pc/`](pc/) | PC | Image tracking, crops and verification using local MobileNetV2 ONNX |
 | [`tests/`](tests/) | Development / CI | Cart, ROS adapter and fault regression tests |
 | [`scripts/`](scripts/) | Development | Interface synchronization and test runner |
 | [`docs/`](docs/) | Both hosts | Setup and hardware acceptance |
 
 **Only image processing and verification run on the PC.** The Pi owns cart state
-and checkout permission. API keys stay on the PC. The existing touchscreen theme
+and checkout permission. The live vision pipeline makes no API calls. The existing touchscreen theme
 is retained with compact per-item verification indicators.
 
 ## Setup
@@ -34,7 +34,7 @@ After completing setup:
 
 ```bash
 # PC
-bash pc/run_verifier.sh backend:=local
+bash pc/run_verifier.sh catalog_path:=/path/to/products.json
 
 # Pi, in the touchscreen desktop session
 bash raspberry_pi/run_cart.sh \
@@ -44,10 +44,13 @@ bash raspberry_pi/run_cart.sh \
   upi_payee:=YOUR_REAL_MERCHANT_UPI_ADDRESS
 ```
 
-Select `backend:=ai` with an image-capable endpoint and model to evaluate a
-vision API. The Pi contract is unchanged. References, embeddings, downloaded
-models, measured catalogues, runtime databases and credentials are local assets;
-capture/import/build them using the setup guide.
+The current vision pipeline samples 3–5 full-frame motion views and accepts any
+matching view, tolerating contours, shadows and short occlusions. It has no
+scan/cart boxes and does not wait for weight before image inference. See the
+[full-frame migration and launch guide](docs/LENIENT_VISION_SETUP.md) before
+updating either host: the image topic and verdict interfaces changed.
+References, generated embeddings, ONNX models and measured catalogues remain
+local assets. API comparison utilities are retained as offline experiments.
 
 ## Software checks
 
@@ -69,4 +72,5 @@ Pi message definitions are canonical. After editing them, run
 Standalone experiments and historical notes remain in `pc/` and `pc/docs/`;
 they are not launched by the integrated runtime. See [repository notes](docs/REPOSITORY.md).
 
-For repeated `MERGED` or multiple-region retries, use the [tracking calibration guide](docs/TRACKING_CALIBRATION.md).
+The old geometric `MERGED`/multiple-region checks are retired. Use the
+[full-frame setup guide](docs/LENIENT_VISION_SETUP.md) for current tuning.
