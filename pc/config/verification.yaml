@@ -1,10 +1,17 @@
-# Calibrate on the PC using preview:=true. Coordinates are normalized L,T,R,B.
-# Include the ENTIRE path and basket; never hide a place where goods can enter.
+# Full-frame motion sampling. No scan/cart regions or merge limits.
 pc_product_verifier:
   ros__parameters:
-    scene_region: [0.0, 0.0, 1.0, 1.0]
-    scanner_region: [0.0, 0.0, 0.45, 1.0]
-    cart_region: [0.55, 0.0, 1.0, 1.0]
-    # Actual foreground area is used when the detector provides a mask.
-    # Leave this guard unchanged until genuine placements AND swaps are tested.
-    merge_area_ratio: 1.35
+    similarity_threshold: 0.65
+    colour_threshold: 0.30
+    size_ratio_tolerance: 3.0
+    removal_margin: 0.03
+    min_motion_area: 100.0
+    warmup_frames: 15
+    capture_seconds: 2.5
+    sample_interval: 0.08
+    min_samples: 3
+    max_samples: 5
+    result_timeout: 6.0
+    max_inflight: 8
+    removal_grace_seconds: 2.0
+    quiet_seconds: 0.8

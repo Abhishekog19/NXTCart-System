@@ -7,5 +7,5 @@ setup(name='nxtcart_vision', version='2.0.0', packages=['nxtcart_vision'],
       install_requires=['setuptools'], zip_safe=False,
       maintainer='NXTCart', maintainer_email='maintainer@example.com',
       description='PC product verification service', license='MIT',
-      entry_points={'console_scripts': ['vision_verify_node = nxtcart_vision.node:main',
+      entry_points={'console_scripts': ['vision_verify_node = nxtcart_vision.vision_verify_node:main',
                                        'capture_references = nxtcart_vision.reference_capture:main']})
