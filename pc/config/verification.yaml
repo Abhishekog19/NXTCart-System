@@ -1,17 +1,14 @@
-# Full-frame motion sampling. No scan/cart regions or merge limits.
+# Continuous frames; only Pi weight settlement triggers inference.
 pc_product_verifier:
   ros__parameters:
     similarity_threshold: 0.65
     colour_threshold: 0.30
     size_ratio_tolerance: 3.0
     removal_margin: 0.03
-    min_motion_area: 100.0
-    warmup_frames: 15
-    capture_seconds: 2.5
-    sample_interval: 0.08
-    min_samples: 3
+    buffer_seconds: 3.0
+    buffer_max_frames: 90
+    min_samples: 1
     max_samples: 5
+    settlement_timeout: 18.0
     result_timeout: 6.0
     max_inflight: 8
-    removal_grace_seconds: 2.0
-    quiet_seconds: 0.8
