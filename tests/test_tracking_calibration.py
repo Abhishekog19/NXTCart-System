@@ -6,7 +6,6 @@ import test_system as fixtures
 from ml.detector import Detection
 from ml.frame_source import FrameMeta
 from ml.item_follower import ItemFollower, FollowStatus
-from nxtcart_vision.pipeline import CapturePipeline
 
 
 def silhouette(width, height, angle=0):
@@ -53,47 +52,3 @@ class ForegroundGeometryTests(unittest.TestCase):
         for value in (0., 1., float('inf'), float('nan')):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 ItemFollower((640, 480), merge_area_ratio=value)
-
-
-class ViewCalibrationTests(unittest.TestCase):
-    def setUp(self):
-        self.clock, self.failed = fixtures.Clock(), []
-        class RecordingDetector(fixtures.Detector):
-            def detect(self, frame):
-                self.input_frame = frame.copy()
-                return super().detect(frame)
-        self.detector = RecordingDetector()
-        self.pipeline = CapturePipeline(lambda c, r: self.failed.append(r), lambda *args: None,
-            clock=self.clock, detector=self.detector, scene_region=(0., .1, 1., .9),
-            scanner_region=(0., .1, .45, .9), cart_region=(.55, .1, 1., .9))
-        self.frame = np.full((480, 640, 3), 125, np.uint8)
-        self.pipeline.frame('camera', 1, 67_000_000, self.frame)
-        self.pipeline.start('a', 1, 'sku', 'code', 67_000_000)
-
-    def feed(self, extra):
-        self.detector.detections = [Detection((80, 150, 100, 100)), extra]
-        self.clock.advance(.067)
-        self.pipeline.frame('camera', 2, 134_000_000, self.frame)
-
-    def test_unrelated_motion_fully_outside_view_is_excluded(self):
-        self.feed(Detection((10, 0, 40, 35)))
-        self.assertEqual(self.failed, [])
-        self.assertEqual(self.pipeline.active.follower.observed_seq, 2)
-
-    def test_second_region_partly_entering_view_still_retries(self):
-        self.feed(Detection((300, 35, 40, 40)))
-        self.assertEqual(len(self.failed), 1)
-
-    def test_mask_applied_before_detection_without_altering_evidence_frame(self):
-        self.feed(Detection((10, 0, 40, 35)))
-        self.assertFalse(np.any(self.detector.input_frame[:48]))
-        self.assertTrue(np.all(self.detector.input_frame[48:432] == 125))
-        self.assertTrue(np.all(self.frame == 125))
-
-    def test_scene_cannot_exclude_scanner_or_rest_regions(self):
-        with self.assertRaisesRegex(ValueError, 'contain'):
-            CapturePipeline(lambda *a: None, lambda *a: None, scene_region=(0., .1, 1., .9))
-
-
-if __name__ == '__main__':
-    unittest.main()

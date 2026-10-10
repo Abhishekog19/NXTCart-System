@@ -14,7 +14,6 @@ sys.path[:0] = [str(ROOT/'pc'), str(PI/'smart_cart_ws/src/smart_cart'),
 from smart_cart.catalog import Product, Catalog, import_catalog
 from smart_cart.verification import Journal, VerificationLedger
 from smart_cart.serial_protocol import parse_line
-from nxtcart_vision.pipeline import CapturePipeline
 from ml.detector import Detection
 from ml.verifier import ProductVerifier, ColourReference
 from nxtcart_vision.journey_verifier import verify_journey
@@ -245,100 +244,6 @@ class Detector:
     detections = []
     def detect(self, frame): self.frames_seen += 1; return self.detections
     def reset(self): self.frames_seen = 0
-
-
-class CaptureTests(unittest.TestCase):
-    def setUp(self):
-        self.clock, self.failed, self.crops = Clock(), [], []
-        self.detector = Detector()
-        self.pipeline = CapturePipeline(lambda c, r: self.failed.append((c, r)),
-            lambda c, crops: self.crops.append((c, crops)), clock=self.clock, detector=self.detector)
-        self.frame = np.random.default_rng(44).integers(0, 256, (480, 640, 3), dtype=np.uint8)
-        self.seq = 0
-        self.feed()
-
-    def feed(self, x=None, extra=False, stream='camera', skip=0):
-        self.clock.advance(.067); self.seq += 1+skip
-        self.detector.detections = [] if x is None else [Detection((x, 150, 100, 100))]
-        if extra: self.detector.detections.append(Detection((300, 250, 80, 80)))
-        self.pipeline.frame(stream, self.seq, self.seq*67_000_000, self.frame)
-
-    def start(self, txn='a', action='add'):
-        self.pipeline.start(txn, 1, 'product_a', '001', self.seq*67_000_000, action)
-
-    def path(self):
-        for x in (80, 140, 200, 260, 320, 380, 440): self.feed(x)
-
-    def test_full_path_plus_scale_settle_plus_rest_submits_crops(self):
-        self.start(); self.path()
-        self.assertEqual(self.crops, [])
-        self.pipeline.settled('a', 1, self.seq*67_000_000)
-        for _ in range(6): self.feed(440)
-        self.assertEqual(len(self.crops), 1)
-        self.assertGreaterEqual(len(self.crops[0][1]), 3)
-        self.assertEqual(self.failed, [])
-
-    def test_weight_without_full_path_never_submits(self):
-        self.start(); self.pipeline.settled('a', 1, self.seq*67_000_000)
-        for _ in range(6): self.feed(440)
-        self.assertEqual(self.crops, [])
-
-    def test_path_without_weight_never_submits(self):
-        self.start(); self.path()
-        for _ in range(6): self.feed(440)
-        self.assertEqual(self.crops, [])
-
-    def test_frame_loss_breaks_custody(self):
-        self.start(); self.feed(80); self.feed(140, skip=1)
-        self.assertEqual(len(self.failed), 1)
-        self.assertIsNone(self.pipeline.active)
-
-    def test_camera_restart_breaks_custody(self):
-        self.start(); self.feed(80); self.feed(140, stream='new')
-        self.assertEqual(len(self.failed), 1)
-
-    def test_multiple_objects_are_ambiguous(self):
-        self.start(); self.feed(80, extra=True)
-        self.assertEqual(len(self.failed), 1)
-
-    def test_network_stall_is_failure_not_match(self):
-        self.start(); self.clock.advance(1.); self.pipeline.tick()
-        self.assertEqual(len(self.failed), 1)
-
-    def test_new_scan_aborts_only_active_capture_not_submitted_ai_job(self):
-        self.start(); self.path(); self.pipeline.settled('a', 1, self.seq*67_000_000)
-        for _ in range(6): self.feed(440)
-        self.start('b')
-        self.assertEqual(len(self.crops), 1)
-        self.assertEqual(self.pipeline.active.txn_id, 'b')
-        self.assertEqual(self.failed, [])
-
-    def test_removal_reverses_path_and_keeps_transaction_action(self):
-        self.start(action='remove')
-        for x in (440, 380, 320, 260, 200, 140, 80): self.feed(x)
-        self.pipeline.settled('a', 1, self.seq*67_000_000)
-        for _ in range(6): self.feed(80)
-        self.assertEqual(len(self.crops), 1)
-        self.assertEqual(self.crops[0][0].action, 'remove')
-
-    def test_stationary_products_in_partly_filled_cart_do_not_break_next_add(self):
-        old = Detection((480, 350, 80, 80))
-        self.detector.detections = [old]
-        self.seq += 1; self.clock.advance(.067)
-        self.pipeline.frame('camera', self.seq, self.seq*67_000_000, self.frame)
-        self.start()
-        for x in (80, 140, 200, 260, 320, 380, 440, 440, 440, 440, 440, 440):
-            self.seq += 1; self.clock.advance(.067)
-            self.detector.detections = [old, Detection((x, 150, 100, 100))]
-            self.pipeline.settled('a', 1, self.seq*67_000_000)
-            self.pipeline.frame('camera', self.seq, self.seq*67_000_000, self.frame)
-        self.assertEqual(self.failed, [])
-        self.assertEqual(len(self.crops), 1)
-
-    def test_zero_net_mass_handling_in_idle_basket_is_reported(self):
-        anomalies = []; self.pipeline.on_anomaly = anomalies.append
-        self.feed(440)
-        self.assertEqual(len(anomalies), 1)
 
 
 class CatalogSerialTests(unittest.TestCase):

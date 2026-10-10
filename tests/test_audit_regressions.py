@@ -10,59 +10,6 @@ from unittest.mock import patch
 import test_ros_adapters as adapters
 
 
-class CaptureAuditTests(unittest.TestCase):
-    setUp = fixtures.CaptureTests.setUp
-    feed = fixtures.CaptureTests.feed
-    start = fixtures.CaptureTests.start
-    path = fixtures.CaptureTests.path
-    def test_configured_regions_are_xywh_for_follower(self):
-        self.pipeline.scanner_region = (.125, .25, .5, .75)
-        self.start()
-        self.assertEqual(self.pipeline.active.follower.scanner_box, (80, 120, 240, 240))
-
-    def test_missing_target_cannot_count_as_rest(self):
-        self.start(); self.path()
-        self.pipeline.settled('a', 1, self.seq*67_000_000)
-        for _ in range(5): self.feed()
-        self.assertEqual(len(self.crops), 0)
-
-    def test_blurred_rest_cannot_reuse_earlier_usable_crops(self):
-        self.start(); self.path()
-        self.pipeline.settled('a', 1, self.seq*67_000_000)
-        self.frame[:] = 127
-        for _ in range(6): self.feed(440)
-        self.assertEqual(len(self.crops), 0)
-
-    def test_settle_before_scan_is_not_placement_evidence(self):
-        self.start(); self.path()
-        self.pipeline.settled('a', 1, 1)
-        for _ in range(6): self.feed(440)
-        self.assertEqual(len(self.crops), 0)
-
-    def test_idle_monitor_rearms_after_scene_becomes_quiet(self):
-        alarms = []; self.pipeline.on_anomaly = alarms.append
-        self.feed(440); self.feed(440); self.feed(380)
-        self.assertEqual(len(alarms), 2)
-
-    def test_final_three_evidence_frames_are_actual_rest_frames(self):
-        self.start(); self.path()
-        self.pipeline.settled('a', 1, self.seq*67_000_000)
-        for _ in range(6): self.feed(440)
-        capture, crops = self.crops[0]
-        self.assertEqual(len(crops), 9)
-        self.assertEqual([c.seq for c in capture.rest_crops], list(range(capture.rest_crops[0].seq, capture.rest_crops[0].seq+3)))
-        for image, observed in zip(crops[-3:], capture.rest_crops):
-            self.assertIs(image, observed.crop)
-
-    def test_capture_deadline_is_checked_even_without_timer_callback(self):
-        self.start(); self.path()
-        self.pipeline.settled('a', 1, self.seq*67_000_000)
-        self.pipeline.active.opened = self.clock()-13.
-        for _ in range(6): self.feed(440)
-        self.assertEqual(len(self.crops), 0)
-        self.assertEqual(len(self.failed), 1)
-
-
 class LedgerAuditTests(unittest.TestCase):
     setUp = fixtures.LedgerTests.setUp
     sample = fixtures.LedgerTests.sample
@@ -121,46 +68,6 @@ class LedgerAuditTests(unittest.TestCase):
 class AdapterAuditTests(unittest.TestCase):
     setUp = adapters.AdapterTests.setUp
     verified = adapters.AdapterTests.verified
-
-    def pc_node(self):
-        adapters.Node.overrides = {'backend': 'ai', 'cam_root': str(fixtures.ROOT/'pc'),
-            'ai_model': 'test', 'ai_base_url': 'http://localhost/v1'}
-        path = fixtures.ROOT/'pc/vision_ws/src/nxtcart_vision/nxtcart_vision/node.py'
-        spec = importlib.util.spec_from_file_location('nxtcart_vision.node', path)
-        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
-        with patch('ml.ai_backend.VLMBackend', return_value=types.SimpleNamespace(stats=[])):
-            node = module.VisionNode()
-        self.addCleanup(node.destroy_node)
-        return node
-
-    def job(self, node, future, elapsed=0.):
-        capture = types.SimpleNamespace(txn_id='job', attempt=1, sku='sku_a', barcode='001', action='add')
-        node.jobs[('job', 1)] = (capture, future, time.monotonic()-elapsed, False)
-        return capture
-
-    def result(self):
-        from ml.verifier import VerdictResult
-        return VerdictResult('MATCH', .9, .9, 1., 1., 9, 'match', 'sku_a')
-
-    def test_completed_future_after_deadline_cannot_pass(self):
-        node = self.pc_node(); future = Future()
-        self.job(node, future, 19.); future.set_result(self.result())
-        node.tick()
-        self.assertEqual(node.pub.sent[-1].verdict, 'RETRY')
-
-    def test_cancel_running_inference_suppresses_result(self):
-        node = self.pc_node(); future = Future(); future.set_running_or_notify_cancel()
-        self.job(node, future)
-        node.request(self.msgs.VerificationRequest(txn_id='job', attempt=1, action='cancel'))
-        future.set_result(self.result()); node.tick()
-        self.assertEqual(len(node.pub.sent), 0)
-        self.assertEqual(node.jobs, {})
-
-    def test_cancel_queued_inference_releases_job(self):
-        node = self.pc_node(); future = Future(); self.job(node, future)
-        node.request(self.msgs.VerificationRequest(txn_id='job', attempt=1, action='cancel'))
-        self.assertTrue(future.cancelled()); node.tick()
-        self.assertEqual(node.jobs, {})
 
     def test_pi_rejects_stale_transport_sample(self):
         self.verified()

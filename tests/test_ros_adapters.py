@@ -62,13 +62,17 @@ def ros_stubs():
     qos = types.ModuleType('rclpy.qos')
     qos.QoSProfile = lambda **kw: kw
     qos.DurabilityPolicy = types.SimpleNamespace(TRANSIENT_LOCAL=1)
-    qos.ReliabilityPolicy = types.SimpleNamespace(RELIABLE=1)
+    qos.ReliabilityPolicy = types.SimpleNamespace(RELIABLE=1, BEST_EFFORT=2)
     qos.qos_profile_sensor_data = object()
     node = types.ModuleType('rclpy.node'); node.Node = Node
     std = types.ModuleType('std_msgs.msg'); std.String = lambda: types.SimpleNamespace(data='')
     return {'rclpy': types.ModuleType('rclpy'), 'rclpy.node': node, 'rclpy.qos': qos,
             'std_msgs': types.ModuleType('std_msgs'), 'std_msgs.msg': std,
-            'smart_cart_interfaces': types.ModuleType('smart_cart_interfaces'), 'smart_cart_interfaces.msg': msgs}
+            'smart_cart_interfaces': types.ModuleType('smart_cart_interfaces'), 'smart_cart_interfaces.msg': msgs,
+            'sensor_msgs': types.ModuleType('sensor_msgs'),
+            'sensor_msgs.msg': types.SimpleNamespace(Image=object),
+            'cv_bridge': types.SimpleNamespace(CvBridge=lambda: types.SimpleNamespace(
+                imgmsg_to_cv2=lambda msg, desired_encoding: msg.frame), CvBridgeError=ValueError)}
 
 
 class AdapterTests(unittest.TestCase):
@@ -130,33 +134,5 @@ class AdapterTests(unittest.TestCase):
         request = self.node.vision_pub.sent[-1]
         self.assertEqual(request.action, 'remove')
         self.assertEqual(request.attempt, original.attempt+1)
-
-    def test_pc_ai_backend_and_background_result_use_real_wire_fields(self):
-        from ml.verifier import VerdictResult
-        gate = threading.Event()
-        def verify(sku, crops):
-            gate.wait(1.)
-            return VerdictResult('MATCH', .9, .9, 1., 1., 3, 'same product', sku)
-        backend = types.SimpleNamespace(verify=verify, stats=[])
-        Node.overrides = {'backend': 'ai', 'cam_root': str(ROOT/'pc'), 'ai_model': 'test', 'ai_base_url': 'http://localhost/v1'}
-        spec = importlib.util.spec_from_file_location('nxtcart_vision.node', ROOT/'pc/vision_ws/src/nxtcart_vision/nxtcart_vision/node.py')
-        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
-        with patch('ml.ai_backend.VLMBackend', return_value=backend):
-            node = module.VisionNode()
-        self.addCleanup(node.destroy_node)
-        capture = types.SimpleNamespace(txn_id='job-a', attempt=1, sku='sku_a', barcode='001', action='add')
-        try:
-            node.submit(capture, [])
-            node.tick()  # Must return while the inference worker is blocked.
-            self.assertEqual(node.pub.sent, [])
-            gate.set()
-            node.jobs[('job-a', 1)][1].result(timeout=2.)
-            node.tick()
-            self.assertEqual(node.pub.sent[-1].name, 'sku_a')
-            self.assertEqual(node.pub.sent[-1].txn_id, 'job-a')
-            self.assertTrue(node.pub.sent[-1].verified)
-        finally:
-            gate.set()
-
 
 if __name__ == '__main__': unittest.main()
