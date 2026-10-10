@@ -68,3 +68,5 @@ Pi message definitions are canonical. After editing them, run
 `python scripts/sync_interfaces.py`, commit both copies, and rebuild both hosts.
 Standalone experiments and historical notes remain in `pc/` and `pc/docs/`;
 they are not launched by the integrated runtime. See [repository notes](docs/REPOSITORY.md).
+
+For repeated `MERGED` or multiple-region retries, use the [tracking calibration guide](docs/TRACKING_CALIBRATION.md).

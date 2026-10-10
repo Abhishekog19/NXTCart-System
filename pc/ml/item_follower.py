@@ -126,7 +126,10 @@ class ItemFollower:
     FollowStatus.BROKEN the transaction must resolve RETRY.
     """
 
-    def __init__(self, frame_size: Tuple[int, int]) -> None:
+    def __init__(self, frame_size: Tuple[int, int], merge_area_ratio=MERGE_AREA_RATIO) -> None:
+        if not math.isfinite(merge_area_ratio) or merge_area_ratio <= 1.0:
+            raise ValueError('merge_area_ratio must be finite and greater than one')
+        self.merge_area_ratio = merge_area_ratio
         self.frame_w, self.frame_h = frame_size
         self._scanner_box = _region_px(SCANNER_REGION, self.frame_w, self.frame_h)
         self._cart_box = _region_px(CART_ENTRY_REGION, self.frame_w, self.frame_h)
@@ -138,6 +141,9 @@ class ItemFollower:
         self.reached_cart = False
         self.observed_seq = None
         self.current_crop = None
+        self.failure_reason = ''
+        self.area_ratio = 1.0
+        self._uses_mask = False
 
         # Kept crops, keyed by seq so one physical frame contributes once.
         self._kept: List[KeptCrop] = []
@@ -205,7 +211,8 @@ class ItemFollower:
 
         target = candidates[0]
         self.target_bbox = target.bbox
-        self._baseline_area = float(max(target.area, 1))
+        self._uses_mask = target.foreground_area is not None
+        self._baseline_area = float(target.foreground_area if self._uses_mask else max(target.area, 1))
         self._misses = 0
         self.status = FollowStatus.TRACKING
         self.observed_seq = meta.seq if meta is not None else None
@@ -228,6 +235,7 @@ class ItemFollower:
             self._misses += 1
             if self._misses > VERIFY_LOST_GRACE_FRAMES:
                 self.status = FollowStatus.LOST
+                self.failure_reason = 'No detection could be associated with the product'
             return self.status
 
         best_score, best = scored[0]
@@ -236,13 +244,25 @@ class ItemFollower:
         # one IS the target.  Ambiguity is a broken chain, not a coin flip.
         if len(scored) >= 2 and (best_score - scored[1][0]) < ASSOC_AMBIGUOUS_MARGIN:
             self.status = FollowStatus.AMBIGUOUS
+            self.failure_reason = 'Two regions compete for the tracked product'
             return self.status
 
         # The matched blob is far larger than the target's established size:
         # the item has fused with the hand or another item into one blob, so
         # its crop is contaminated and its centroid untrustworthy.
-        if self._baseline_area and best.area > MERGE_AREA_RATIO * self._baseline_area:
+        # Axis-aligned box area can double when a packet rotates, although its
+        # silhouette has not grown. Use the actual foreground mask consistently
+        # for real camera detections; scripted/box-only detectors keep box units.
+        measured_area = best.foreground_area if self._uses_mask else best.area
+        if measured_area is None:
+            self.status = FollowStatus.LOST
+            self.failure_reason = 'Product foreground mask is missing; geometry cannot be compared'
+            return self.status
+        self.area_ratio = measured_area / max(self._baseline_area or 1., 1.)
+        if self.area_ratio > self.merge_area_ratio:
             self.status = FollowStatus.MERGED
+            metric = 'foreground' if self._uses_mask else 'bounding-box'
+            self.failure_reason = f'{metric} area grew {self.area_ratio:.2f}x (limit {self.merge_area_ratio:.2f}x); hand/object overlap or a depth change'
             return self.status
 
         # Good, unambiguous match — advance the target.
@@ -251,8 +271,8 @@ class ItemFollower:
         self.observed_seq = meta.seq if meta is not None else None
         # Let the baseline grow slowly toward the item's true size but never
         # jump (a jump would be the very merge we just guarded against).
-        self._baseline_area = max(self._baseline_area or best.area,
-                                  float(best.area))
+        self._baseline_area = max(self._baseline_area or measured_area,
+                                  float(measured_area))
         self._record_crop(best, frame, meta)
         self._record_trail(best)
 

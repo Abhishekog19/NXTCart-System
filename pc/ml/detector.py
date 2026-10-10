@@ -94,6 +94,14 @@ class Detection:
         return int(w * h)
 
     @property
+    def foreground_area(self) -> Optional[int]:
+        """Visible silhouette area, unaffected by empty corners of a rotated box."""
+        if self.mask is None or self.mask.shape != (self.bbox[3], self.bbox[2]):
+            return None
+        pixels = int(np.count_nonzero(self.mask))
+        return pixels if pixels > 0 else None
+
+    @property
     def centroid(self) -> Tuple[float, float]:
         x, y, w, h = self.bbox
         return (x + w / 2.0, y + h / 2.0)
