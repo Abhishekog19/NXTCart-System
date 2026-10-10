@@ -1,3 +1,5 @@
+> Current architecture: [weight-triggered rolling buffer](docs/WEIGHT_TRIGGERED_VISION.md). This supersedes motion-triggered capture instructions below.
+
 # NXTCart
 
 Dual-webcam shopping cart with independent weight and product-image verification.

@@ -1,3 +1,5 @@
+> Current architecture: [weight-triggered rolling buffer](WEIGHT_TRIGGERED_VISION.md). This supersedes motion-triggered capture instructions below.
+
 # Full-frame local ONNX verification
 
 This is the current PC vision workflow, replacing geometric scan/cart zones.

@@ -1,3 +1,5 @@
+> Current architecture: [weight-triggered rolling buffer](../docs/WEIGHT_TRIGGERED_VISION.md). This supersedes motion-triggered capture instructions below.
+
 # PC full-frame image verification
 
 Start with [LENIENT_VISION_SETUP.md](../docs/LENIENT_VISION_SETUP.md).
