@@ -1,4 +1,4 @@
-> Current architecture: [weight-triggered rolling buffer](WEIGHT_TRIGGERED_VISION.md). This supersedes motion-triggered capture instructions below.
+> Historical motion-based setup. Use [WEIGHT_TRIGGERED_VISION.md](WEIGHT_TRIGGERED_VISION.md) for the current foreground burst verifier, thresholds and camera rate.
 
 # Full-frame local ONNX verification
 

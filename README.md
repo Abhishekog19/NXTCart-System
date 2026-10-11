@@ -1,4 +1,4 @@
-> Current architecture: [weight-triggered rolling buffer](docs/WEIGHT_TRIGGERED_VISION.md). This supersedes motion-triggered capture instructions below.
+> Current architecture: [weight-triggered foreground bursts](docs/WEIGHT_TRIGGERED_VISION.md). Includes deployment and hardware acceptance checks.
 
 # NXTCart
 

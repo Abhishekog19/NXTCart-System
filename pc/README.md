@@ -1,26 +1,23 @@
-> Current architecture: [weight-triggered rolling buffer](../docs/WEIGHT_TRIGGERED_VISION.md). This supersedes motion-triggered capture instructions below.
+# PC foreground product verification
 
-# PC full-frame image verification
+The current architecture and complete deployment checklist are in
+[WEIGHT_TRIGGERED_VISION.md](../docs/WEIGHT_TRIGGERED_VISION.md).
 
-Start with [LENIENT_VISION_SETUP.md](../docs/LENIENT_VISION_SETUP.md).
-The active node is `vision_ws/src/nxtcart_vision/nxtcart_vision/vision_verify_node.py`.
-It consumes `sensor_msgs/Image` through cv_bridge and scans through ScannedItem,
-collects 3–5 motion frames without geometric tracking, and compares crops using
-local MobileNetV2 ONNX. Any matching view can approve the camera gate.
+The PC buffers 120 camera frames at 30 FPS. Only the Pi weight settlement event
+triggers a dense burst from 400 ms before to 150 ms after settlement. Foreground
+ROIs are extracted against a pre-entry baseline; full frames never enter ONNX.
+MobileNetV2 compares each crop against every catalog SKU, requiring target top-1,
+cosine >= 0.72 and margin >= 0.04. Confident alternate products are flagged as
+swaps. Weight and checkout remain controlled by the Pi.
 
-From the repository root after rebuilding both ROS workspaces:
+After rebuilding the PC workspace, run from the repository root:
 
 ```bash
 bash pc/run_verifier.sh catalog_path:=/path/to/products.json preview:=true
 ```
 
-The model and database default to `pc/ml/mobilenet_v2.onnx` and
-`pc/embedding_db.pkl` through the launcher. Catalogue mapping is optional only
-when the database already resolves scanner barcodes. Colour and apparent-size
-metadata are used when available. The Pi owns cart state, weight and checkout.
-
-Historical geometric tracking, retired tests and prior one-off patch scripts
-are retained in `legacy/`; do not apply those patches to the current node.
-AI comparison/dataset tools remain development utilities; no API is called by
-the live ROS node. Capture references in `pc/references/<sku>/` and use
-`build_db.py` from `pc/` to rebuild an ONNX-stamped database when needed.
+Models and database default to `pc/ml/mobilenet_v2.onnx` and `pc/embedding_db.pkl`.
+Debug full frames, ROIs and scores are retained in `pc/debug_frames/`, bounded to
+100 transactions. Override the directory with `debug_dir:=/path/to/debug`.
+Runtime assets and debug images are not committed. Historical geometric and API
+comparison tools are development utilities; the live ROS node calls no cloud API.
