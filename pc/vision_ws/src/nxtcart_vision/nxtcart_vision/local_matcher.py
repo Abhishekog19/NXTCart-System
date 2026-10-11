@@ -1,5 +1,6 @@
 """MobileNetV2 ONNX embeddings with optional colour and apparent-size evidence."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import math
 import json
 import pickle
 from pathlib import Path
@@ -11,7 +12,7 @@ from ml.verifier import colour_hist
 def normalized(vector, dimension=1280):
     value = np.asarray(vector, dtype=np.float32).reshape(-1)
     norm = float(np.linalg.norm(value))
-    if value.size != dimension or not np.isfinite(value).all() or norm < 1e-8:
+    if value.size != dimension or not np.isfinite(value).all() or not math.isfinite(norm) or norm < 1e-8:
         raise ValueError(f'Expected a finite, nonzero {dimension}-dimension vector')
     return value / norm
 
@@ -63,18 +64,25 @@ class Result:
     score: float = 0.
     colour: float = 0.
     reason: str = ''
+    code: str = ''
+    evaluations: list = field(default_factory=list)
 
 
 class LocalMatcher:
-    def __init__(self, model_path, database_path, catalog_path='', threshold=.65,
-                 colour_threshold=.30, size_ratio_tolerance=3., removal_margin=.03,
-                 embedding_layer='', embedder=None):
+    def __init__(self, model_path, database_path, catalog_path='', threshold=.72,
+                 colour_threshold=.30, size_ratio_tolerance=3., removal_margin=.04,
+                 embedding_layer='', embedder=None, competitive_margin=.04, swap_threshold=.70):
+        if not all(math.isfinite(x) for x in (threshold, colour_threshold, size_ratio_tolerance, removal_margin, competitive_margin, swap_threshold)):
+            raise ValueError('All matcher thresholds must be finite')
+        if not 0 <= competitive_margin <= 1 or not 0 < swap_threshold <= 1:
+            raise ValueError('Invalid competitive margin or swap threshold')
+        self.competitive_margin, self.swap_threshold = competitive_margin, swap_threshold
         if not 0 < threshold <= 1 or not 0 <= colour_threshold <= 1 or size_ratio_tolerance < 1 or not 0 <= removal_margin <= 1:
             raise ValueError('Invalid similarity, colour, size or removal-margin threshold')
         self.threshold, self.colour_threshold = threshold, colour_threshold
         self.size_tolerance, self.removal_margin = size_ratio_tolerance, removal_margin
         # This is a local, trusted database. Never load an untrusted pickle.
-        with open(database_path, 'rb') as handle:
+        with Path(database_path).expanduser().open('rb') as handle:
             raw = pickle.load(handle)
         if not isinstance(raw, dict) or not raw:
             raise ValueError('Embedding database must be a nonempty dictionary')
@@ -128,11 +136,11 @@ class LocalMatcher:
         if not self.products:
             raise ValueError('Database has no products')
         if catalog_path:
-            for row in json.loads(Path(catalog_path).read_text(encoding='utf-8')):
+            for row in json.loads(Path(catalog_path).expanduser().read_text(encoding='utf-8')):
                 if row['sku'] in self.products:
                     self.alias(row['barcode'], row['sku'])
                     self.alias(row['name'], row['sku'])
-        self.embedder = embedder or MobileNetONNX(model_path, embedding_layer)
+        self.embedder = embedder or MobileNetONNX(Path(model_path).expanduser(), embedding_layer)
 
     @staticmethod
     def key(value):
@@ -167,25 +175,53 @@ class LocalMatcher:
         return similarity, colour_score, colour_ok and size_ok
 
     def verify(self, sku, samples):
+        """Rank every catalog SKU for every foreground ROI, never full scenes.
+
+        All crops are evaluated, including frames after the first match. A
+        confident alternate product vetoes a target match elsewhere in the
+        burst so a hand-held target cannot hide a different dropped product.
+        """
         if sku and sku not in self.products:
             return Result('UNAVAILABLE', sku, reason='No reference embeddings for scanned barcode/SKU')
-        best = Result('MISMATCH', sku or '', score=-1., reason='No sampled view matched the database')
-        # Multiple contours are crop candidates, not an ambiguity error. At most
-        # five physical frames are passed here; one matching view may approve.
-        for sample in samples:
-            for crop in sample:
+        evaluations, matches, swaps, failures = [], [], [], []
+        for frame_index, sample in enumerate(samples):
+            for crop_index, crop in enumerate(sample):
+                entry = dict(frame_index=frame_index, crop_index=crop_index)
                 try:
-                    embedding = self.embedder.embed(crop)
-                except (ValueError, cv2.error):
-                    # A corrupt/blank candidate must not discard other views.
+                    if crop is None or crop.ndim != 3 or crop.shape[2] != 3 or min(crop.shape[:2]) < 8:
+                        raise ValueError('Invalid foreground ROI')
+                    embedding = normalized(self.embedder.embed(crop))
+                    ranked = sorted(((self.score(key, crop, embedding), key)
+                                     for key in self.products), key=lambda row: (-row[0][0], row[1]))
+                except (ValueError, cv2.error) as exc:
+                    evaluations.append(dict(entry, verdict='UNAVAILABLE', error=str(exc)))
                     continue
-                ranked = sorted([(self.score(key, crop, embedding), key)
-                    for key in ([sku] if sku else self.products)], reverse=True)
                 (score, colour, evidence_ok), key = ranked[0]
-                margin_ok = bool(sku) or len(ranked) == 1 or score-ranked[1][0][0] >= self.removal_margin
-                if score > best.score:
-                    best = Result('MISMATCH', key, score, colour, 'No sampled view passed similarity and available colour/size checks')
-                if score >= self.threshold and evidence_ok and margin_ok:
-                    return Result('MATCH', key, score, colour,
-                        f'One sampled view matched {key}: cosine={score:.3f}; optional colour/size checks passed')
-        return best
+                runner = ranked[1][0][0] if len(ranked) > 1 else -1.
+                target_score = next((row[0][0] for row in ranked if row[1] == sku), score)
+                margin = score - runner
+                required_margin = self.competitive_margin if sku else self.removal_margin
+                if sku and key != sku and score >= self.swap_threshold:
+                    result = Result('MISMATCH', key, score, colour,
+                                    f'Product swap detected: observed {key} instead of {sku}', 'SWAP_DETECTED')
+                    swaps.append(result)
+                elif (not sku or key == sku) and score >= self.threshold and margin >= required_margin and evidence_ok:
+                    result = Result('MATCH', key, score, colour,
+                                    f'Target is top-1: cosine={score:.3f}, margin={margin:.3f}; colour/size passed', 'MATCH')
+                    matches.append(result)
+                else:
+                    reason = (f'Embedding similarity below confidence threshold or competitive margin: '
+                              f'top1={key}, score={score:.3f}, target={target_score:.3f}, '
+                              f'margin={margin:.3f}, colour/size={evidence_ok}')
+                    result = Result('MISMATCH', sku or key, score, colour, reason, 'LOW_CONFIDENCE')
+                    failures.append(result)
+                evaluations.append(dict(entry, top1=key, score=score, target_score=target_score,
+                                        runner_up=ranked[1][1] if len(ranked) > 1 else '',
+                                        runner_up_score=runner, margin=margin, colour=colour,
+                                        evidence_ok=bool(evidence_ok), verdict=result.verdict,
+                                        code=result.code))
+        pool = swaps or matches or failures
+        result = max(pool, key=lambda item: item.score) if pool else Result(
+            'UNAVAILABLE', sku, reason='No valid foreground embeddings could be evaluated', code='NO_EMBEDDING')
+        result.evaluations = evaluations
+        return result

@@ -13,6 +13,7 @@ def generate_launch_description():
         'model_path': PathJoinSubstitution([root, 'ml', 'mobilenet_v2.onnx']),
         'database_path': PathJoinSubstitution([root, 'embedding_db.pkl']),
         'catalog_path': '', 'preview': 'false',
+        'debug_dir': PathJoinSubstitution([root, 'debug_frames']),
         'config_file': PathJoinSubstitution([root, 'config', 'verification.yaml']),
     }
     args = [DeclareLaunchArgument(k, default_value=v) for k,v in defaults.items()]

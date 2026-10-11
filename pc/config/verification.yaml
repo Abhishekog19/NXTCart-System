@@ -1,14 +1,27 @@
-# Continuous frames; only Pi weight settlement triggers inference.
+# Weight-triggered dense burst. Full frames are never passed to ONNX.
 pc_product_verifier:
   ros__parameters:
-    similarity_threshold: 0.65
+    similarity_threshold: 0.72
+    competitive_margin: 0.04
+    swap_threshold: 0.70
     colour_threshold: 0.30
     size_ratio_tolerance: 3.0
-    removal_margin: 0.03
-    buffer_seconds: 3.0
-    buffer_max_frames: 90
-    min_samples: 1
-    max_samples: 5
+    removal_margin: 0.04
+    buffer_seconds: 4.0
+    buffer_max_frames: 120
+    burst_before: 0.40
+    burst_after: 0.15
+    baseline_before: 0.90
+    baseline_tolerance: 0.15
+    burst_min_frames: 12
+    burst_max_gap: 0.08
+    transport_grace: 0.75
+    camera_loss_timeout: 5.0
+    foreground_min_area: 800.0
+    difference_threshold: 25
+    roi_padding: 0.12
+    max_roi_fraction: 0.65
+    debug_keep: 100
     settlement_timeout: 18.0
     result_timeout: 6.0
     max_inflight: 8

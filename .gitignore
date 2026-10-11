@@ -40,3 +40,5 @@ pc/results/
 .vscode/
 .DS_Store
 Thumbs.db
+
+pc/debug_frames/
