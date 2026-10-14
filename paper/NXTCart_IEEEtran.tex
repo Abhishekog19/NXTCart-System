@@ -1,0 +1,1717 @@
+%=====================================================================
+%  NXTCart --- IEEEtran conference manuscript (standalone)
+%
+%  COMPILATION STATUS: *** NOT VERIFIED ***
+%  No TeX distribution (pdflatex/xelatex/lualatex/latexmk) was present on
+%  the host where this file was produced, so it has NOT been compiled.
+%  Treat it as unproven source. To build:
+%
+%      pdflatex NXTCart_IEEEtran.tex
+%      pdflatex NXTCart_IEEEtran.tex          % twice for cross-references
+%
+%  Requires: IEEEtran.cls (from the IEEE Author Center template package)
+%  Packages used, all standard in TeX Live / MiKTeX:
+%      cite graphicx amsmath amssymb algorithm algpseudocode
+%      booktabs array multirow url xcolor textcomp
+%
+%  The bibliography is inlined as thebibliography, so NO bibtex run is
+%  needed. An equivalent nxtcart_cited.bib is shipped alongside for
+%  reference-manager import.
+%
+%  Figures: each \includegraphics is commented out and replaced by a
+%  visible placeholder box, so the file compiles with no image assets.
+%  Uncomment the \includegraphics lines once the figures are exported
+%  per NXTCart_Figures_Tables_Equations.md.
+%
+%  Tables I and IX are abridged here to keep the two-column layout
+%  tractable; the full versions are in NXTCart_Manuscript.md.
+%=====================================================================
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{textcomp}
+\usepackage{url}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+% Placeholder figure box so the document compiles without image assets.
+\newcommand{\figplaceholder}[2]{%
+  \fbox{\parbox[c][#2][c]{0.95\columnwidth}{\centering\footnotesize\itshape #1}}}
+\newcommand{\figplaceholderwide}[2]{%
+  \fbox{\parbox[c][#2][c]{0.97\textwidth}{\centering\footnotesize\itshape #1}}}
+
+% Pending-measurement marker: grep-able in the compiled PDF.
+\newcommand{\tbm}[1]{\textcolor{red}{\texttt{[TO BE MEASURED: #1]}}}
+\newcommand{\tbr}[1]{\textcolor{red}{\texttt{[TO BE RECORDED: #1]}}}
+
+\begin{document}
+
+\title{Settlement-Triggered, Foreground-Only Verification of\\
+Scanned Products in a Barcode-First Smart Shopping Cart:\\
+Prototype Architecture and Evaluation Protocol}
+
+\author{
+\IEEEauthorblockN{[Author 1 Name]\IEEEauthorrefmark{1},
+                  [Author 2 Name]\IEEEauthorrefmark{1},
+                  [Author 3 Name]\IEEEauthorrefmark{1},
+                  [Author 4 Name]\IEEEauthorrefmark{2}}
+\IEEEauthorblockA{\IEEEauthorrefmark{1}[Department], [Institution], [City], [Country]\\
+Email: \{[email1], [email2], [email3]\}@[domain]}
+\IEEEauthorblockA{\IEEEauthorrefmark{2}[Department], [Institution], [City], [Country]\\
+Email: [email4]@[domain]}
+}
+
+\maketitle
+
+\begin{abstract}
+Self-checkout and smart-cart systems move product identification from a trained cashier to the
+shopper, which creates a verification problem: the store must establish that the physical object
+placed in the basket is the object whose barcode was presented. Combining barcode, weight and image
+evidence is long-established prior art, so this paper does not claim that combination as a
+contribution. Instead we specify and document a prototype, NXTCart, whose distinguishing design
+choices are mechanisms rather than modalities: (i) visual inference is neither continuous nor
+scan-triggered but is launched retrospectively from a bounded, source-timestamped frame history when
+the cart's load cell reports a \emph{settled} mass change, so the evidence window is selected after
+the physical event rather than guessed before it; (ii) only connected foreground regions obtained by
+differencing against a \emph{pre-entry} baseline frame are embedded, so no full scene --- and
+therefore no basket background --- ever reaches the recognition network; (iii) each candidate region
+is scored against \emph{every} registered SKU rather than only the scanned one, and a sufficiently
+confident alternate SKU anywhere in the burst \emph{vetoes} a matching region elsewhere, so an early
+correct view cannot outvote a later substituted product; (iv) every verdict is bound to a transaction
+and attempt identifier, and the weight and image gates remain \emph{independent and conjunctive}
+rather than fused into a single score, so a visual match can never clear a mass failure. We give the
+complete runtime contract: a Raspberry~Pi owns both USB cameras, barcode decoding, the catalogue, the
+durable per-unit ledger and checkout permission; an Arduino/HX711 performs calibrated acquisition, a
+six-sample stability test and an independent transaction-specific expected-weight comparison; a PC
+runs foreground segmentation and local MobileNetV2 ONNX embedding comparison over ROS~2. We
+contribute a quantitative feasibility analysis showing that, with the shipped firmware constants, the
+settlement timestamp necessarily lags mechanical impact by at least approximately $0.5$~s, so the
+configured window observes the product \emph{at rest} rather than in descent, and that the
+configuration is self-consistent only while the impact-to-settlement delay stays below $0.90$~s ---
+beyond which the selected baseline becomes contaminated by the product itself. We provide a
+reproducible evaluation protocol with baselines, ablations of each mechanism, an adversarial and
+nuisance scenario matrix, metric denominators and leakage controls. Results are explicitly pending.
+\end{abstract}
+
+\begin{IEEEkeywords}
+smart shopping cart, product verification, barcode switching, weight reconciliation, foreground
+segmentation, embedding similarity, event-triggered sensing, ROS~2, selective classification, retail
+loss prevention
+\end{IEEEkeywords}
+
+%---------------------------------------------------------------------
+\section*{Document Status}
+This is a system-design and prototype manuscript. Every quantitative claim about recognition
+accuracy, latency, power, cost or theft coverage is marked \tbm{\ldots} because the hardware
+acceptance campaign of Section~\ref{sec:eval} has not been executed. The only measurements reported
+as completed are the host-independent software checks of Section~\ref{sec:results}, which the authors
+executed at the stated repository revision. Nothing here implies venue acceptance, peer review, store
+deployment or completed field validation.
+
+%---------------------------------------------------------------------
+\section{Introduction}
+\label{sec:intro}
+
+\subsection{Problem}
+Automated retail identification has been studied extensively from the perception side: surveys of
+computer-vision approaches to in-store product identification~\cite{R49} and of deep learning for
+retail product recognition~\cite{R50} document a large literature on detecting and classifying
+merchandise. A smaller but more directly relevant line of work treats the task as \emph{verification}
+rather than \emph{recognition} --- deciding whether a presented object is consistent with a declared
+product identity, explicitly motivated by barcode switching and missed scans at
+self-checkout~\cite{R51}. Commercial smart-cart products describe camera and weight checks on the
+cart itself~\cite{R81,R82}; these are vendor descriptions, cited only as deployment context and not
+as evidence of accuracy or loss reduction.
+
+The gap addressed here is not ``can a cart see products''. It is narrower and more mechanical:
+\emph{given that a shopper has scanned a barcode, which pixels constitute admissible evidence about
+the object that just entered the basket, and what decision rule over those pixels is defensible when
+the evidence may be incomplete?}
+
+\subsection{Scope and what is not claimed}
+Carts combining an identifier reader with a load cell and a camera are at least a decade old. A 2018
+barcode-first design already combined weight checks, product images and a cloud
+inventory~\cite{R84}, and a 2013 wireless-sensor cart already combined a load cell with image
+comparison for billing verification~\cite{R85}. A 2026 cart contributes a load-cell
+weight-reconciliation algorithm with tolerance windows and drift compensation and explicitly lists
+adding camera verification to disambiguate equal-weight items as \emph{future work}~\cite{R02}. A
+2025 cart fuses RGB-D vision, basket weight and RFID at the decision level and already triggers full
+detection only when the weight sensor reports a significant change~\cite{R01}. Consequently this
+paper claims \emph{neither} multimodal cart verification, \emph{nor} weight reconciliation, \emph{nor}
+weight-triggered visual inference as novel.
+
+The visual method is likewise deliberately conventional. Decoupling localisation from classification
+and classifying by nearest-reference similarity in an embedding space --- so that a new SKU requires
+only new reference photographs and no retraining --- is established retail practice~\cite{R07}, and
+class-verification formulations for self-checkout products have been compared directly~\cite{R52}. We
+use an unmodified pretrained MobileNetV2~\cite{R31} as a frozen feature extractor and claim no
+representation-learning contribution.
+
+\subsection{Research question}
+\emph{Does transaction-bound agreement between a scanned barcode, an independently checked settled
+mass change, and a foreground-only visual verification of the scanned SKU reduce accepted
+substitution and billing errors relative to barcode-only, barcode-plus-weight and
+barcode-plus-vision baselines, at an acceptable honest-shopper retry rate and end-to-end latency?}
+This is a framing, not a result.
+
+\subsection{Contributions}
+\begin{enumerate}
+\item A fully specified, source-verified runtime contract for a three-host barcode-first verification
+cart on ROS~2~\cite{R54}: topic graph, message schemas, quality-of-service settings, bounded buffers,
+timeout and cancellation semantics, durable per-unit state and the checkout predicate.
+\emph{Evidence: static inspection of the launched source at a recorded revision.}
+\item \textbf{Settlement-triggered retrospective evidence selection}, admitting a burst only if it is
+dense ($\geq 12$ frames) and gap-free ($\leq 80$~ms, both edges included), and abstaining otherwise.
+\emph{Implemented and unit-tested; a design choice, not a demonstrated improvement.}
+\item \textbf{Foreground-only inference}: full frames are never embedded; global scene changes and
+scene-sized boxes are refused. \emph{Implemented and unit-tested.}
+\item \textbf{All-SKU competition with a burst-level substitution veto}. \emph{Implemented and
+unit-tested; effectiveness against real lookalikes is} \tbm{substitution detection rate}.
+\item \textbf{Independent, non-fused, conjunctive gates with transaction/attempt binding}, in contrast
+to decision-level fusion~\cite{R01}. \emph{Implemented and unit-tested; motivated by
+selective-classification reasoning~\cite{R61} rather than by measurement.}
+\item A \textbf{quantitative settlement-timing feasibility analysis} (Section~\ref{sec:timing})
+derived from the shipped firmware constants. \emph{Analytical; the delay distribution is}
+\tbm{$\Delta_s$ distribution}.
+\item A \textbf{reproducible evaluation protocol} with baselines, mechanism ablations, an adversarial
+and nuisance matrix, explicit denominators and leakage controls.
+\end{enumerate}
+Contributions 2--5 are \emph{design choices and hypotheses}. We have not established that any
+improves a measurable outcome, and Section~\ref{sec:related} states precisely which elements have
+close prior art.
+
+%---------------------------------------------------------------------
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Identification-centric carts}
+The dominant historical architecture reads an identifier and bills it: RFID carts with mobile
+billing~\cite{R10} and RFID/ZigBee automatic-billing carts~\cite{R18} establish that wireless cart
+billing long predates camera-based verification. One supplied comparator uses an EM-18 reader with a
+ZigBee/ESP uplink and an LCD running total~\cite{R11}; its experiments concern reader behaviour versus
+distance and item removal, not SKU-level visual identity. We note a specification conflict within it:
+its method text names a $125$~kHz EM-18 reader while its component table lists an $860$--$960$~MHz
+band. We therefore cite it for architecture and workflow only, relying on component datasheets for
+electrical facts.
+
+A second comparator combines YOLO-based image counting with an RFID \emph{wallet} for payment and a
+weight sensor comparing an aggregate basket total against an expected total~\cite{R12}. Two
+distinctions matter. An RFID payment card is not a per-product tag; conflating them overstates
+identification coverage. And that paper's own conclusion states that the implemented project
+classifies and prices items \emph{without considering their brands} --- a material difference from
+verifying a branded SKU. Earlier Springer cart work~\cite{R83} and a secure-shopping architecture with
+an explicit communication protocol~\cite{R06} complete the family. None establishes that identifier
+reading alone resolves substitution: a correct read is consistent with a different physical object
+entering the basket.
+
+\subsection{Weight-centric carts and reconciliation}
+Load-cell carts and racks~\cite{R47}, anti-theft carts combining RFID/ZigBee with weight~\cite{R48}
+and theft-control prototypes~\cite{R17} form the weight-centric family. The most directly relevant
+recent work is a 2026 load-cell-assisted weight-reconciliation algorithm~\cite{R02}, which addresses
+exactly the problems our mass gate faces: vibration noise on a moving cart, scan-to-settle latency and
+drift. Using an HX711 at $80$~SPS with a $10$-sample moving-average filter and a tolerance window
+with a constant drift offset, it reports weight-measurement error averaging $0.87\,\%$ over four
+grocery items at $n=30$ trials each; a fraud-detection confusion matrix over $100$ simulated
+transaction cycles (46~TP, 4~FN, 2~FP, 48~TN) giving $94.0\,\%$ accuracy, $95.8\,\%$ precision and
+$92.0\,\%$ recall; an approximately $420$~ms scan-to-verification delay; and a false-positive rate
+below $4\,\%$ with filtering versus $28\,\%$ without. Those are that paper's measurements under its
+conditions, reproduced here only as attributed prior art.
+
+Three observations follow. First, the headline ``$96\,\%$ weight detection accuracy'' in its abstract
+is not directly derivable from its Table~I (average error $0.87\,\%$ implies a much higher figure) or
+its Table~III ($94.0\,\%$); comparisons should quote the table values. Second, several of its
+references could not be resolved to identifiable venues, so we cite it for its own described method
+and results and do not follow its citation graph. Third, and decisively for positioning, its future
+work proposes adding computer vision to resolve ambiguities among identical-weight items. NXTCart
+implements that direction, making it a \emph{complement} to~\cite{R02} rather than a priority claim,
+and meaning its visual gate must be evaluated specifically on the equal-mass cases where a weight
+gate is provably uninformative.
+
+\subsection{Camera-plus-weight carts}
+A 2019 billing cart pairs a YOLO-style detector with an HX711 load cell for produce, reporting
+3~classes and $70\,\%$ detection accuracy with the cell calibrated to $5$~kg~\cite{R04}. A 2024 cart
+uses a Raspberry~Pi~4, an Arduino Mega~2560, four $100$~kg load cells via HX711 and an Edge
+Impulse--trained model over 5~items; its reported evaluation is a six-position weight-distribution
+test and qualitative per-item outcomes~\cite{R05}. That system introduces an ``Unknown item'' state
+when the camera fails but the scale detects an addition, blocking checkout until removal --- the same
+\emph{function} as NXTCart's unreconciled-mass block, which we therefore do not claim as new.
+
+TAV-Cart~\cite{R03} is the closest \emph{design} comparator: barcode scanners, a strain-gauge load
+cell and a camera-based scanner stated to ``ensure the product being placed in the cart is the right
+one, thus no item switching will occur'', with cloud validation, an LED status strip, a manual
+item-validation mode and UPI payment. It is explicitly an initial concept and contains no quantitative
+evaluation. This is instructive: the asserted elimination of item switching is exactly the claim this
+paper refuses to make, because a single camera cannot certify a fully occluded exchange
+(Section~\ref{sec:limits}).
+
+A 2026 multimodal cart~\cite{R26} uses a Raspberry~Pi~5, HX711 load cells, an Intel RealSense D435i
+depth camera, YOLOv11 and A* navigation with a Firestore backend; its anti-theft logic holds checkout
+on a depth intrusion without a preceding barcode trigger. Its results section is an interface
+walkthrough with qualitative statements; no accuracy, latency or detection-rate figures are reported.
+Cloud/edge cart baselines~\cite{R09,R24} and an AI-driven cart with tracking and inventory
+forecasting~\cite{R21} complete the family; the latter is relevant only as context for \emph{proposed}
+extensions, since NXTCart implements no forecasting or navigation.
+
+The 2025 fusion cart~\cite{R01} is the closest \emph{method} comparator: RGB-D camera, load cell and
+RFID reader; YOLOv8-s triggered on a stabilised weight change; a Gaussian-like weight-compatibility
+score and a binary RFID support score fused into a weighted sum whose argmax is the predicted SKU,
+with a low-confidence branch asking the shopper to confirm. On a self-collected set of 1000 products
+($\approx$75{,}000 labelled frames, 80{,}000 event instances) it reports $98.7\,\%$ event-level top-1,
+$0.8\,\%$ misidentification and $0.3$~s per item, against $93.5\,\%$ (vision-only) and $95.0\,\%$
+(RFID-only), with a V/V+W/V+R/V+W+R ablation.
+
+Four differences define NXTCart against~\cite{R01}. \emph{Objective}: \cite{R01} recognises which SKU
+an event corresponds to; NXTCart verifies a scanned expectation and may refuse. \emph{Fusion}:
+\cite{R01} combines modalities into one score, so visual confidence can compensate for an
+inconsistent mass; NXTCart keeps the gates independent and conjunctive precisely to forbid that.
+\emph{Evidence extent}: \cite{R01} selects key frames; NXTCart retains every delivered frame in the
+window and refuses when the window is sparse or gapped. \emph{Region content}: \cite{R01} embeds
+detector outputs; NXTCart embeds only pre-entry-baseline differences, a stronger restriction with its
+own failure modes.
+
+We record that~\cite{R01} has internal citation inconsistencies: its introduction attributes shelf
+monitoring to reference [6] while its list assigns [6] to a general machine-learning paper, attributes
+a multimodal e-commerce dataset to [9] while its list assigns [9] to yoghurt-cup recognition, prints
+two entries numbered [7], and cites a [15] absent from a list ending at [14]. Separately, a 70/10/20
+split described as performed ``at the SKU level to avoid leakage'' is difficult to reconcile with
+evaluating a fixed-class YOLOv8 classifier, whose output layer cannot predict held-out classes. We
+treat these as reproducibility questions, not refutations, and do not copy that paper's citation
+mapping.
+
+\subsection{Retail visual recognition and verification}
+Automatic-checkout research on conveyor video follows a detect-track-count paradigm; DeepACO combines
+Scaled-YOLOv4 with SORT and reports $F_1 = 0.4783$ (second place) on the 2022 AI City Challenge
+Track~4 test set~A over 116 product identities, trained from 116{,}500 synthetic
+composites~\cite{R27}. That $F_1$ calibrates expectations: fine-grained retail identification from
+video is hard even for purpose-built pipelines. Benchmarks such as RPC~\cite{R42}, densely packed
+shelf detection~\cite{R38}, hierarchical grocery datasets~\cite{R39} and digital-twin training
+data~\cite{R63} define the recognition task; multi-camera kiosk classification~\cite{R08} and
+context-aware fine-grained classification~\cite{R30} address viewpoint and lookalike confusion.
+General-purpose representations~\cite{R58,R59} and recent SKU-level retrieval with open
+vision-language models~\cite{R62} are plausible replacements for our frozen MobileNetV2 and are listed
+as future comparators, not implemented alternatives.
+
+The most informative comparator for our decision rule is~\cite{R07}: RT-DETR localisation followed by
+metric-embedding similarity against a reference database, requiring no retraining for new SKUs. It
+reports $79.67\,\%$ Precision@1 and $49.79\,\%$ mAP at 10 classes, degrading to $67.53\,\%$ and
+$38.07\,\%$ at 40 classes, with hyperbolic embeddings outperforming Euclidean at
+$24.65$--$81.09$~ms per inference and a forgetting rate under $10\,\%$, attributing the dominant error
+source to classification among visually similar products rather than to localisation. Two
+consequences are direct. First, since NXTCart uses the same family of mechanism (crop $\rightarrow$
+frozen embedding $\rightarrow$ nearest reference) with a weaker backbone, we must not expect better
+open-set behaviour --- which is itself the argument for verifying against a scanned expectation and
+refusing when uncertain. Second, because visually similar products dominate the error, the lookalike
+and equal-mass cases of Section~\ref{sec:eval} are the decisive experiments.
+
+Three tasks must therefore be separated, as the literature often blurs them:
+\emph{object-category recognition} (``this is a tomato''~\cite{R04}); \emph{fine-grained branded-SKU
+identification} (``brand $X$, not brand $Y$''~\cite{R07,R27,R42,R30}); and \emph{verification against
+a scanned expectation} (``is this consistent with the SKU just scanned, and may I
+refuse?''~\cite{R51,R52}). NXTCart performs the third and uses all-SKU scoring only as a
+\emph{contrastive device} within it, not as an identification claim.
+
+\subsection{Multimodal retail sensing and fusion theory}
+Shelf-side systems combining vision, weight and location --- FAIM~\cite{R45} and AIM3S~\cite{R46} ---
+are the strongest open prior art on how mass and image evidence interact, including failure cases;
+shelf mass is partitioned per product position, whereas a cart's single aggregate cell cannot
+attribute simultaneous placements. Classical~\cite{R37} and modern~\cite{R53} fusion treatments frame
+evidence combination and uncertainty, but general fusion theory does not establish that this cart's
+channels are independent: the Pi's delta computation and the Arduino's comparison share one load
+cell, so their agreement is \emph{computational} redundancy, not sensor redundancy. Work on
+calibration~\cite{R60} and selective classification~\cite{R61} underpins our refusal behaviour: a
+cosine similarity is not a probability of correct verification, and a system that may abstain should
+be characterised by risk against coverage rather than by accuracy alone.
+
+\subsection{Systems and methods background}
+ROS~2~\cite{R54} supplies the distributed substrate, and its quality-of-service model~\cite{R72} is
+what makes frame loss an explicit, observable design parameter rather than a hidden failure.
+Detector~\cite{R34} and tracker~\cite{R35,R36} foundations are cited because the cart literature is
+built on them and because NXTCart's retired predecessor used tracking; the current runtime contains no
+detector and no tracker, so we report no tracking metrics.
+
+\begin{table*}[!t]
+\caption{Comparison of cart and checkout systems on verification-relevant dimensions (abridged; full
+version in the supplementary material). ``FT'' = full text read, ``MD'' = metadata/abstract level
+only. ``Not reported'' means absent from the source we read, not an assertion that the property is
+absent. Figures are each source's own, under its own conditions, and are \emph{not} comparable across
+rows.}
+\label{tab:related}
+\centering
+\scriptsize
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}p{0.030\textwidth}p{0.018\textwidth}p{0.016\textwidth}p{0.115\textwidth}p{0.105\textwidth}p{0.105\textwidth}p{0.115\textwidth}p{0.085\textwidth}p{0.145\textwidth}p{0.115\textwidth}@{}}
+\toprule
+Ref & Yr & Rd & Identification & Vision role & Weight role & Temporal/event assoc. & Compute & Measured task \& result & Limitations \\
+\midrule
+\cite{R01} & 2025 & FT & RGB-D + cell + RFID, decision fusion & Primary recogniser (YOLOv8-s), fused & Gaussian compatibility vs nominal mass & Weight trigger; short window; IoU tracking & Embedded SoC, INT8 & 1000 products, $\sim$80k events: 98.7\% acc., 0.8\% misID, 0.3 s/item; V 93.5, V+W 96.1, V+R 97.3 & Occlusion, tag conflict; citation inconsistencies; SKU split vs fixed head \\
+\cite{R02} & 2026 & FT & Barcode + cell only & None & Primary: delta matching, tolerance + drift offset & Scan or weight event in window $T$; 10-sample MAF & ESP32 + tablet, cloud DB & 0.87\% avg error (4 items, $n{=}30$); 100 cycles: 94.0\% acc., 95.8\% prec., 92.0\% rec.; $\sim$420 ms; FPR $<$4\% (vs 28\%) & $<$20 g exempt; equal-weight unresolved (vision = future work) \\
+\cite{R03} & 2024 & FT & Barcode (laser; optional camera) & Asserted anti-switching; not evaluated & Continuous, cloud cross-check & Continuous; manual/auto validation mode & Cart CPU + cloud & None --- explicitly an initial concept & No evaluation; horizontal barcodes unscannable \\
+\cite{R26} & 2026 & FT & Barcode + cell + active stereo & Depth intrusion; YOLOv11 audit & Primary: mass vs declared & Intrusion \emph{without} barcode $\rightarrow$ hold & Pi 5 + Firestore & Qualitative walkthrough; no numbers reported & No quantitative validation \\
+\cite{R07} & 2025 & FT & Vision only: RT-DETR + metric embeddings & Whole pipeline; nearest reference, no retraining & None & None (shelf stills) & Workstation & 79.67\% P@1 / 49.79\% mAP @10 cls; 67.53 / 38.07 @40; 24.65--81.09 ms & Errors dominated by similar products; IoU $\approx$0.68 \\
+\cite{R27} & 2022 & FT & Vision only: YOLOv4 + SORT & Whole pipeline & None & Track IDs; count inside ROI & Not on-cart & AI City 2022 T4-A: $F_1{=}0.4783$, 116 IDs & Occlusion, blur, similarity; synth-to-real gap \\
+\cite{R11} & 2022 & FT & RFID (EM-18) & None & Display only & None & Nano + ESP8266 + ZigBee & Reader behaviour vs distance/removal & No SKU identity check; 125 kHz vs 860--960 MHz conflict \\
+\cite{R12} & 2022 & FT & RFID on product \emph{groups} + RFID wallet & YOLOv3 counting & Aggregate total vs expected & None & On-cart + Wi-Fi & Example detections; counting & Own conclusion: prices \emph{without} brands \\
+\cite{R04} & 2019 & FT & Vision only (produce) & Category classifier & Per-item mass pricing & None & Arduino + host & 3 classes; 70\% detection; cell to 5 kg & Category level only \\
+\cite{R05} & 2024 & FT & Barcode + vision (Edge Impulse) & Category recogniser; ``Unknown item'' blocks checkout & 4$\times$100 kg cells; unscanned-addition detection & None & Pi 4 + Mega 2560 & 5 items; 6-position test; qualitative & Cucumber problematic; no aggregate metrics \\
+\cite{R45} & 2020 & MD & Shelf vision + weight + location & One fused channel & One fused channel, per position & Shelf events & Store infra. & Inventory accuracy (abstract level) & Shelf, not cart; full text pending \\
+\cite{R46} & 2019 & MD & Multimodal shelf sensing & One fused channel & One fused channel & Store events & Store infra. & Inventory monitoring (abstract level) & Shelf, not cart; full text pending \\
+\cite{R51} & 2022 & MD & Declared vs observed, OCR + classification & Verification with conformal abstention & None & Per presentation & Not reported & Product verification w/ Mondrian conformal prediction & Full text pending; OCR-dependent \\
+\midrule
+\textbf{Ours} & 2026 & --- & \textbf{Barcode primary; vision verifies the scanned SKU, never identifies alone} & \textbf{Foreground-only ROIs vs all SKUs; abstains; vetoes on confident alternate} & \textbf{Independent conjunctive gate: Pi delta + firmware check, same cell} & \textbf{Retrospective burst from a 4 s/120-frame ring around settled mass; density+gap admissibility; txn/attempt binding} & \textbf{Pi: sensors, catalogue, ledger, checkout. Arduino: acquisition + verdict. PC: segmentation + ONNX} & \textbf{Software checks only (Sec.~\ref{sec:results}); accuracy, latency, detection} \tbm{all} & \textbf{No proof against occluded substitution; one cell cannot attribute concurrent placements; UPI QR is a request, not settlement} \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+%---------------------------------------------------------------------
+\section{Problem Formulation and Design Requirements}
+\label{sec:problem}
+
+\subsection{Entities}
+Let $\mathcal{K}$ be the set of registered SKUs. The catalogue maps a barcode to
+$(\text{barcode},\text{name},\text{sku},w_e,\mathrm{tol},\text{price})$ where $w_e>0$ is the
+\emph{gross packaged} mass in grams, $0<\mathrm{tol}<w_e$ and $\text{price}>0$; these constraints are
+enforced at import and at every lookup. A \emph{unit} is one physical instance of a SKU in one cart
+session, identified by a transaction identifier $\tau$ and an \emph{attempt} counter
+$a\in\mathbb{N}^{+}$. The pair $(\tau,a)$ is the association key for every piece of evidence.
+
+\subsection{Events and evidence}
+For the $(\tau,a)$ of interest: $t_{\text{scan}}$ is a decode accepted by the scan gate; $t_s$ is the
+host-clock timestamp of the first \emph{stable, calibrated} sample whose deviation from the current
+anchor exceeds the noise threshold and which the ledger assigns to this unit --- \textbf{a
+stable-sample timestamp, not a mechanical impact interrupt}; and
+$\mathcal{F}=\{(u_i,s_i,I_i)\}$ is the PC frame ring, with $s_i$ the source (Pi-clock) timestamp
+applied immediately after camera read, $u_i$ the PC monotonic receive time and $I_i$ a BGR image.
+
+\subsection{The verification task}
+Given $(\tau,a)$, the scanned SKU $k^*\in\mathcal{K}$, the settled mass delta $\Delta$ and
+$\mathcal{F}$, produce a mass verdict $V_w\in\{\textsc{pass},\textsc{fail},\textsc{pending},
+\textsc{checking}\}$ and an image verdict $V_c\in\{\textsc{match},\textsc{mismatch},\textsc{retry},
+\textsc{unavailable}\}$ with a reason code, such that a unit becomes billable only if both gates
+reach \textsc{pass} for the \emph{current} attempt, and such that a system that cannot obtain
+admissible evidence \emph{abstains} rather than guessing in either direction. This is a
+selective-classification formulation~\cite{R61}: coverage is a free variable and must be reported
+alongside error.
+
+\subsection{Threat and nuisance model}
+\textbf{Adversarial} (must not be accepted): A1 barcode switching; A2 equal-mass substitution (mass
+gate provably uninformative); A3 lookalike substitution; A4 unscanned insertion; A5 duplicate-scan
+exploitation; A6 removal fraud; A7 occlusion attacks; A8 timing attacks during a camera outage,
+settlement wait or restart window.
+
+\textbf{Honest nuisances} (must not be falsely rejected, or must be recoverable): N1 hands in frame;
+N2 shadows and lighting change; N3 motion blur; N4 partial occlusion by existing contents; N5 dropped
+frames; N6 variable impact-to-settlement delay; N7 scale drift; N8 cart movement; N9 cancelled or
+retried placements; N10 service restarts.
+
+\subsection{Derived requirements}
+Table~\ref{tab:req} lists the requirements these threats imply, together with the implementation
+status of each at the revision inspected in Section~\ref{sec:impl}.
+
+\begin{table}[!t]
+\caption{Derived design requirements and their implementation status.}
+\label{tab:req}
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}p{0.025\columnwidth}p{0.36\columnwidth}p{0.10\columnwidth}p{0.39\columnwidth}@{}}
+\toprule
+ID & Requirement & Rationale & Status in current code \\
+\midrule
+R1 & Evidence associable to exactly one $(\tau,a)$ & A5, A6, A8 & Implemented: $(\tau,a)$ keys on both hosts; completed-key cache; identity mismatch $\rightarrow$ \textsc{retry} \\
+R2 & Mass and image decisions must not compensate & A2, A3 & Implemented: conjunctive gates; a camera \textsc{match} cannot clear a mass \textsc{fail} \\
+R3 & Evidence window chosen \emph{after} the physical event & N6 & Implemented: retrospective extraction from a bounded ring \\
+R4 & Incomplete visual evidence abstains & N5, N6 & Implemented: density and gap tests; missing baseline $\rightarrow$ \textsc{retry} \\
+R5 & Background pixels must not enter the network & N2, N4 & Implemented: foreground-only ROIs; global change refused \\
+R6 & Early correct view must not outvote a later substitution & A2, A3, A7 & Implemented: all-SKU scoring + burst-level veto \\
+R7 & Unexplained mass blocks checkout until accounted mass returns & A4 & Implemented: unassigned-weight issue latches the checkout reason \\
+R8 & Loss of observation invalidates trust & A8, N10 & Implemented: camera-generation change, heartbeat gap and scale restart force reconciliation \\
+R9 & Restart must not resurrect unfinished units as verified & A8, N10 & Implemented: SQLite WAL journal; non-\textsc{verified} units failed on load \\
+R10 & Concurrency limits must be physical & A5, N8 & Implemented: overlapping unsettled placements flagged ambiguous, never guessed \\
+R11 & Payment authorisation $\neq$ payment request & --- & \emph{Partial}: revision-gated UPI QR; \textbf{no provider confirmation exists} \\
+R12 & Light curtains, multiple cells, IMU, navigation, forecasting & future & \textbf{Not implemented}; documented as planned design only \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%---------------------------------------------------------------------
+\section{System Architecture}
+\label{sec:arch}
+
+\subsection{Host responsibilities}
+Fig.~\ref{fig:arch} shows three hosts with a deliberately rigid split, enforced mechanically by an
+import-boundary check in the test runner. The \textbf{Arduino + HX711} performs calibrated
+acquisition at ${\sim}10$~Hz, a six-sample stability test and an \emph{independent}
+transaction-specific expected-mass comparison, with calibration persisted in EEPROM and no auto-tare
+at boot. The \textbf{Raspberry~Pi} owns both USB cameras, barcode/QR decoding, the read-only
+catalogue, the serial bridge, the durable per-unit ledger, the touchscreen and \textbf{checkout
+permission}; it loads no model, embedding database, reference photograph or credential. The
+\textbf{PC} owns the frame ring, foreground segmentation, the MobileNetV2 ONNX database and the
+verdict publisher; it imports nothing from the Pi package, decides no prices and holds no cart state.
+
+\textbf{The PC is advisory; the Pi is authoritative.} This is the most important architectural
+property: a compromised, lagging or restarted verification service can withhold approval but cannot
+grant it, alter a bill or authorise payment.
+
+\begin{figure}[!t]
+\centering
+% \includegraphics[width=\columnwidth]{fig1_architecture}
+\figplaceholder{\textbf{Fig.~1 placeholder.} Export the Mermaid source in the supplementary
+artifacts file (\texttt{mmdc -i fig1.mmd -o fig1.pdf}) and uncomment the \texttt{includegraphics}
+line above. Three swimlanes: Arduino/HX711 $\mid$ Raspberry~Pi (authority) $\mid$ PC (advisory).}{46mm}
+\caption{NXTCart host boundaries and topic graph. Dashed arrows carry advisory verdicts. The single
+\texttt{/cart/placement\_settled} edge is the only inference trigger. The import boundary (no
+\texttt{ml}/\texttt{torch}/\texttt{onnxruntime}/\texttt{nxtcart\_vision} in the Pi package, no
+\texttt{smart\_cart} in the PC package) is enforced by a static check in CI.}
+\label{fig:arch}
+\end{figure}
+
+\subsection{Topic graph and message contract}
+Table~\ref{tab:topics} gives the contract. A deliberate asymmetry: image transport is
+\emph{best-effort} on both ends, so frames may be lost by design~\cite{R72}. Rather than hiding that
+loss, the burst admissibility test of Section~\ref{sec:burst} makes it an explicit, reported outcome.
+
+\begin{table*}[!t]
+\caption{ROS~2 interface contract. Message definitions are byte-identical in both workspaces, checked
+by CI.}
+\label{tab:topics}
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}p{0.175\textwidth}p{0.115\textwidth}p{0.145\textwidth}p{0.175\textwidth}p{0.305\textwidth}@{}}
+\toprule
+Topic & Type & Publisher $\rightarrow$ Subscriber & QoS & Role \\
+\midrule
+\texttt{/cart/camera/frame} & \texttt{sensor\_msgs/Image} (bgr8) & Pi camera $\rightarrow$ PC & Pub: sensor data (best effort); Sub: best effort, depth 30 & Source-stamped frames; \texttt{frame\_id = verification\_camera/<uuid>} carries the camera generation \\
+\texttt{/cart/scanned\_item} & \texttt{ScannedItem} & Pi scanner $\rightarrow$ authority, PC & Reliable, depth 50 & Barcode + \texttt{scan\_id}. \textbf{Logged by the PC; never starts inference} \\
+\texttt{/cart/verification\_request} & \texttt{VerificationRequest} & authority $\rightarrow$ PC & Reliable, depth 50 & \texttt{action} $\in$ \{add, remove, cancel\}; creates or cancels context \\
+\texttt{/cart/placement\_settled} & \texttt{VerificationRequest} & authority $\rightarrow$ PC & Reliable, depth 50 & \texttt{started\_at} = settled-sample stamp. \textbf{The only inference trigger} \\
+\texttt{/cart/vision\_event} & \texttt{VisionEvent} & PC $\rightarrow$ authority & Reliable, depth 50 & Verdict + reason code + scores, bound to $(\tau,a,\text{action})$ \\
+\texttt{/cart/vision\_health} & \texttt{String} (JSON) & PC $\rightarrow$ authority & Reliable, depth 10 & 2~Hz heartbeat: \texttt{ready}, \texttt{generation}, \texttt{inflight}, \texttt{collecting}, \texttt{buffered\_frames}, \texttt{camera\_age\_seconds} \\
+\texttt{/cart/scene\_anomaly} & \texttt{String} & PC $\rightarrow$ authority & Reliable, depth 10 & Camera restart notice $\rightarrow$ forces reconciliation \\
+\texttt{/cart/weight\_sample} & \texttt{WeightSample} & bridge $\rightarrow$ authority & Reliable, depth 50 & \texttt{stream\_id}, \texttt{seq}, \texttt{grams}, \texttt{stable}, \texttt{calibrated}, receive stamp \\
+\texttt{/cart/weight\_expectation} & \texttt{WeightExpectation} & authority $\rightarrow$ bridge $\rightarrow$ Arduino & Reliable, depth 50 & \texttt{E,txn,baseline\_g,expected\_g,tolerance\_g} \\
+\texttt{/cart/weight\_verdict} & \texttt{WeightVerdict} & bridge $\rightarrow$ authority & Reliable, depth 50 & Firmware's independent \textsc{pass}/\textsc{fail} with measured delta \\
+\texttt{/cart/ui\_display} & \texttt{CartState} & authority $\rightarrow$ GUI & Reliable, transient-local, depth 1 & Per-unit statuses, totals, \texttt{revision}, \texttt{checkout\_allowed}, \texttt{checkout\_reason} \\
+\texttt{/cart/\{remove,checkout\}\_request}, \texttt{/cart/checkout\_quote}, \texttt{/cart/alerts} & \texttt{String} & GUI $\leftrightarrow$ authority & Reliable, depth 10 & Selected removal; revision-gated checkout quote \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Durable per-unit state}
+Each unit is persisted to SQLite in WAL mode with \texttt{synchronous=FULL}, alongside an append-only
+audit table and a monotonically increasing \texttt{revision}. The derived display status is
+\textsc{flagged} if any of $\{V_w,V_c,V_{\mathrm{ard}}\}$ is \textsc{fail}, \textsc{verified} if
+$V_w=V_c=\textsc{pass}$, and \textsc{verifying} otherwise, with a separate \textsc{removing} branch.
+On process start, any unit that is not \textsc{verified} is forced to \textsc{fail} --- a restart can
+never resurrect an unfinished unit as billable (R9). See Fig.~\ref{fig:state}.
+
+\begin{figure}[!t]
+\centering
+% \includegraphics[width=\columnwidth]{fig4_state}
+\figplaceholder{\textbf{Fig.~4 placeholder.} Per-unit state machine; export from the Mermaid
+\texttt{stateDiagram-v2} source in the supplementary artifacts file.}{42mm}
+\caption{Per-unit verification state. The two gates are independent and conjunctive;
+\textsc{verified} requires both \textsc{pass} for the \emph{current} attempt, and \textsc{fail} on
+either gate is terminal for that attempt. The firmware's \textsc{checking} intermediate exists so a
+Pi-side mass pass cannot become \textsc{pass} before the independent firmware comparison arrives.
+Recovery from \textsc{flagged} is always via selected removal, which increments the attempt counter.}
+\label{fig:state}
+\end{figure}
+
+\subsection{Checkout predicate}
+Checkout is allowed only when all of the following hold, evaluated in this order so the shopper gets
+the most actionable reason: (1)~the cart is non-empty; (2)~the scale is ready and not in recovery;
+(3)~a fresh ($<2.5$~s) stable calibrated sample exists; (4)~the PC heartbeat is fresh ($<2.5$~s);
+(5)~no global issue is latched; (6)~every unit is \textsc{verified}; (7)~$|g_{\text{latest}} -
+\sum_u \mathrm{measured\_g}(u)| \le 10$~g; (8)~a merchant UPI address is configured; (9)~the quote's
+revision equals the ledger's. Condition~(7) is a \emph{second}, aggregate mass check layered on the
+per-unit checks: a basket of correctly verified units can still be refused if the total does not
+reconcile. Conditions (8)--(9), plus the GUI's own $1.5$~s freshness and \texttt{request\_id} checks,
+mean a displayed quote closes as soon as the cart changes.
+
+\subsection{Shopper experience versus physical concurrency}
+Accepted scans appear in the bill immediately with per-unit Weight/Camera indicators; both gates run
+in the background, and a flagged unit does \emph{not} lock the scanner. This separates two properties
+that are often conflated: \textbf{GUI responsiveness} (rows appear at once and are never blocked by a
+pending or failed earlier unit) from \textbf{physical concurrency restrictions}, which are a hardware
+observability limit enforced regardless of interface latency. With one aggregate load cell the system
+cannot attribute mass to individual simultaneous placements, so the ledger enforces: more than one
+unit awaiting weight $\Rightarrow$ \emph{all} pending units flagged ambiguous and a global overlap
+issue latched; a new scan during a removal $\Rightarrow$ immediate mass-gate failure; a scan while the
+scale is not ready or not fresh $\Rightarrow$ immediate mass-gate failure; and a mass step not
+attributable to exactly one pending unit $\Rightarrow$ an ``unassigned weight'' issue with the anchor
+advanced so the evidence cannot be reused by a later scan. A second placement may legitimately begin
+as soon as the previous unit's mass has settled, even while its image inference is still running; up
+to eight verifications may be in flight.
+
+%---------------------------------------------------------------------
+\section{Methodology and Algorithms}
+\label{sec:method}
+
+\subsection{Frame ingestion and the bounded ring}
+Each accepted frame is stored as $(u_i,s_i,I_i)$ in a deque bounded to $N_{\mathrm{buf}}=120$ entries
+and pruned to $T_{\mathrm{buf}}=4.0$~s of receive time. A frame is rejected if its encoding, dtype or
+dimensions are invalid, if its source-clock age falls outside $[-0.5,5.0]$~s, or if its source stamp
+does not strictly exceed the previous stamp for the same camera generation (a replayed physical frame
+must not supply a second sample). A change of \texttt{frame\_id} is a \emph{camera generation change}:
+the ring is cleared, all in-flight work returns \textsc{retry}, and a scene-anomaly notice forces
+reconciliation. Memory and bandwidth follow from the configuration:
+\begin{align}
+M_{\mathrm{ring}} &= N_{\mathrm{buf}} W H \cdot 3 = 120\cdot640\cdot480\cdot3\ \mathrm{B} = 110.6\ \mathrm{MB}\\
+B_{\mathrm{net}}  &= W H \cdot 3 f = 640\cdot480\cdot3\cdot30\ \mathrm{B/s} \approx 221\ \mathrm{Mb/s}
+\end{align}
+Both are \emph{analytical} figures for raw BGR payload only; DDS, IP and framing overhead, worker
+snapshots and ROS internal buffers add to both. Achieved figures: \tbm{achieved publish rate, receive
+rate, wire bandwidth, PC RSS}.
+
+\subsection{Settlement-triggered burst assembly}
+\label{sec:burst}
+On \texttt{/cart/placement\_settled} with $(\tau,a)$, the node validates that the settlement matches
+the requested transaction (scan id, barcode, resolved SKU and action must all agree, else
+\textsc{retry}), that the SKU resolves in the embedding database (else \textsc{unavailable}), that the
+settlement stamp age lies in $[-0.1,T_{\mathrm{buf}}]$ (else \textsc{retry}, flagging clock skew), and
+that the in-flight limit is not exceeded. It then registers a \emph{collection} rather than
+snapshotting immediately, because the post-event frames have not necessarily arrived and the two
+topics may be reordered. With $t_s$ the settlement stamp,
+\begin{align}
+\mathcal{W}(t_s) &= [\,t_s-\delta_{\mathrm{pre}},\ t_s+\delta_{\mathrm{post}}\,],\quad
+  \delta_{\mathrm{pre}}{=}0.40\,\mathrm{s},\ \delta_{\mathrm{post}}{=}0.15\,\mathrm{s}\\
+b(t_s) &= t_s - \delta_{\mathrm{base}},\qquad \delta_{\mathrm{base}} = 0.90\,\mathrm{s}\\
+\mathcal{B} &= \{(u,s,I)\in\mathcal{F} : b-\delta_{\mathrm{tol}} \le s \le b\},\
+  \delta_{\mathrm{tol}}{=}0.15\,\mathrm{s}
+\end{align}
+Collection completes when the newest received source stamp passes $t_s+\delta_{\mathrm{post}}$, or
+when a transport grace period $T_{\mathrm{grace}}=0.75$~s expires. The burst
+$\mathcal{S}=\{(u,s,I)\in\mathcal{F} : t_s-\delta_{\mathrm{pre}} \le s \le t_s+\delta_{\mathrm{post}}\}$
+is \emph{admissible} only if
+\begin{align}
+\mathcal{B} &\neq \emptyset\\
+|\mathcal{S}| &\ge n_{\min} = 12\\
+\max_i\big(\tilde{s}_{i+1}-\tilde{s}_i\big) &\le g_{\max} = 80\,\mathrm{ms}
+\end{align}
+where $\tilde{s}=[t_s-\delta_{\mathrm{pre}},s_1,\dots,s_{|\mathcal{S}|},t_s+\delta_{\mathrm{post}}]$.
+Including both window edges is deliberate: a burst dense in the middle but missing its first or last
+$100$~ms would otherwise pass. At 30~FPS an admissible burst is normally 16--17 frames. The chosen
+baseline is $\max(\mathcal{B})$ by source stamp, i.e.\ the newest frame at or before $b(t_s)$.
+Algorithm~\ref{alg:burst} gives the procedure.
+
+\begin{algorithm}[!t]
+\caption{Settlement-triggered burst assembly (PC)}
+\label{alg:burst}
+\footnotesize
+\begin{algorithmic}[1]
+\Statex \textbf{On \texttt{/cart/placement\_settled}} with $m=(\tau,a,\ldots,t_s)$:
+\If{$(\tau,a)$ completed, running or collecting} \State \Return \Comment{idempotent} \EndIf
+\State $c \gets \textsc{PendingPop}(\tau,a)$ \textbf{or} $\textsc{ContextFrom}(m)$
+\If{$\textsc{Identity}(c)\neq\textsc{Identity}(m)$}
+  \State \textsc{Publish}(\textsc{retry}, ``settlement mismatch''); \Return \EndIf
+\If{$\textsc{Resolve}(\mathrm{sku},\mathrm{barcode})=\bot$}
+  \State \textsc{Publish}(\textsc{unavailable}, ``unknown SKU''); \Return \EndIf
+\State $\mathrm{age}\gets\textsc{HostClockNow}()-t_s$
+\If{$\mathrm{age}\notin[-0.1,T_{\mathrm{buf}}]$}
+  \State \textsc{Publish}(\textsc{retry}, ``stale settlement; check clock sync''); \Return \EndIf
+\If{$|\mathrm{collecting}|+|\mathrm{running}|\ge 8$}
+  \State \textsc{Publish}(\textsc{retry}, ``queue full''); \Return \EndIf
+\State $w\gets\max(0,\delta_{\mathrm{post}}-\mathrm{age})$
+\State $\mathrm{collecting}[(\tau,a)]\gets(c,t_s,\mathrm{now}{+}w,\mathrm{now}{+}w{+}T_{\mathrm{grace}})$
+\Statex \textbf{On every 20\,Hz tick:}
+\ForAll{$(\tau,a)\in\mathrm{collecting}$}
+  \State $\mathrm{covered}\gets(\text{newest stamp}\ge t_s+\delta_{\mathrm{post}})$
+  \If{$\mathrm{now}<\mathrm{ready}$ \textbf{or} ($\neg\mathrm{covered}$ \textbf{and}
+       $\mathrm{now}<\mathrm{deadline}$)}
+    \State \textbf{continue} \Comment{keep receiving; never snapshot on the callback} \EndIf
+  \State remove $(\tau,a)$ from $\mathrm{collecting}$
+  \State $\mathcal{B}\gets\{f : t_s{-}\delta_{\mathrm{base}}{-}\delta_{\mathrm{tol}}\le
+         \mathrm{stamp}(f)\le t_s{-}\delta_{\mathrm{base}}\}$
+  \State $\mathcal{S}\gets\{f : t_s{-}\delta_{\mathrm{pre}}\le\mathrm{stamp}(f)\le
+         t_s{+}\delta_{\mathrm{post}}\}$
+  \If{$\mathcal{B}=\emptyset$}
+    \State \textsc{Publish}(\textsc{retry}, ``no pre-entry baseline''); \textbf{continue} \EndIf
+  \State $\mathrm{gaps}\gets\textsc{Diffs}([t_s{-}\delta_{\mathrm{pre}}]\|
+         \mathrm{stamps}(\mathcal{S})\|[t_s{+}\delta_{\mathrm{post}}])$
+  \If{$|\mathcal{S}|<n_{\min}$ \textbf{or} $\max(\mathrm{gaps})>g_{\max}$}
+    \State \textsc{Publish}(\textsc{retry}, ``incomplete burst''); \textbf{continue} \EndIf
+  \State \textsc{SubmitToSingleWorker}(\textsc{VerifyBurst}, $\textsc{Newest}(\mathcal{B}),
+         \mathcal{S}, c$)
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Foreground extraction}
+For a baseline $B$ and a burst frame $I$ of identical geometry, the mask is the thresholded
+\emph{per-channel maximum} absolute difference --- chosen over a grayscale difference so a change
+between two similarly bright but differently coloured surfaces is preserved:
+\begin{align}
+D(\mathbf{x}) &= \max_{c\in\{B,G,R\}}\big|B_c(\mathbf{x})-I_c(\mathbf{x})\big|\\
+M(\mathbf{x}) &= \mathbb{1}\!\left[D(\mathbf{x})>\tau_d\right],\qquad \tau_d = 25\\
+M' &= \mathrm{close}_{5\times5}\!\big(\mathrm{open}_{3\times3}(M)\big)
+\end{align}
+using standard binary morphology~\cite{R66}. Two refusals follow, both preventing background from
+reaching the network:
+\begin{align}
+\textstyle\sum_{\mathbf{x}} M'(\mathbf{x}) &> \rho H W,\ \rho=0.65 \Rightarrow \text{refuse}\\
+(x_1{-}x_0)(y_1{-}y_0) &> \rho H W \Rightarrow \text{refuse}
+\end{align}
+where the padded box uses $p=0.12$:
+\begin{equation}
+\begin{aligned}
+x_0 &= \max(0,x{-}\lceil pw\rceil), & y_0 &= \max(0,y{-}\lceil ph\rceil),\\
+x_1 &= \min(W,x{+}w{+}\lceil pw\rceil), & y_1 &= \min(H,y{+}h{+}\lceil ph\rceil).
+\end{aligned}
+\end{equation}
+Components below $A_{\min}=800$~px are discarded as noise; if more than eight components survive the
+frame is refused as ``too many changed regions'' --- many disjoint changes indicate camera shake rather
+than one inserted product, and failing closed is preferred to silently discarding a possibly
+substituted object. Crucially, components are \emph{never merged}: a hand and a product at opposite
+corners stay two tight crops rather than becoming one scene-sized rectangle (Fig.~\ref{fig:fg}).
+Algorithm~\ref{alg:fg} states the procedure.
+
+For a \textbf{selected removal} the roles invert: the departing product is present in the baseline and
+absent from the burst frames, so the difference is computed with the burst frame as reference and the
+\emph{crops are taken from the baseline image}. Cropping the now-empty basket would embed background
+and reintroduce exactly the leakage this design removes.
+
+\begin{figure}[!t]
+\centering
+% \includegraphics[width=\columnwidth]{fig5_foreground}
+\figplaceholder{\textbf{Fig.~5 placeholder.} Foreground-only ROI pipeline; export from the Mermaid
+flowchart in the supplementary artifacts file.}{40mm}
+\caption{Foreground-only ROI pipeline. Three distinct refusal paths (global scene change, oversized
+box, too many regions) replace what would otherwise be a full-frame fallback. Zero regions across the
+whole burst yields \textsc{mismatch}/\texttt{NO\_ITEM\_SEEN}, which is tested \emph{before}
+\texttt{SCENE\_CHANGED}.}
+\label{fig:fg}
+\end{figure}
+
+\begin{algorithm}[!t]
+\caption{Foreground ROI extraction (no full frame is ever embedded)}
+\label{alg:fg}
+\footnotesize
+\begin{algorithmic}[1]
+\Require baseline $B$, frame $I$, $\tau_d,A_{\min},p,\rho$,
+         $\mathrm{action}\in\{\textsf{placed},\textsf{removed}\}$
+\If{$\mathrm{action}=\textsf{removed}$} \State $\textsc{Swap}(B,I)$
+  \Comment{crop from the baseline, never the empty basket} \EndIf
+\If{$\mathrm{shape}(B)\neq\mathrm{shape}(I)$}
+  \State \Return \textsc{reject}(``frame geometry changed'') \EndIf
+\State $M\gets\mathbb{1}[\max_c|B_c-I_c|>\tau_d]$
+\State $M\gets\textsc{Close}_{5\times5}(\textsc{Open}_{3\times3}(M))$
+\If{$\textsc{NonZero}(M)>\rho H W$}
+  \State \Return \textsc{reject}(``global scene change'') \EndIf
+\State $\mathcal{C}\gets$ external contours of $M$, area descending
+\ForAll{$\kappa\in\mathcal{C}$}
+  \If{$\textsc{Area}(\kappa)<A_{\min}$} \State \textbf{continue} \EndIf
+  \State $\beta\gets\textsc{Clip}(\textsc{Pad}(\textsc{BoundingRect}(\kappa),p))$
+  \If{$\textsc{Area}(\beta)>\rho H W$}
+    \State \Return \textsc{reject}(``box covers too much of the scene'') \EndIf
+  \State append $\beta$, $\textsc{Crop}(I,\beta)$ \Comment{components are NEVER merged}
+\EndFor
+\If{$|\mathrm{crops}|>8$}
+  \State \Return \textsc{reject}(``too many changed regions'') \Comment{fail closed} \EndIf
+\State \Return $\mathrm{crops},\mathrm{boxes}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Embeddings and per-region scoring}
+Each crop is resized to $224\times224$, converted BGR$\rightarrow$RGB, scaled to $[0,1]$ and
+normalised with the ImageNet statistics used by the torchvision ONNX export, then transposed to NCHW.
+The embedding is the 1280-dimensional global-average-pooling output --- the standard
+``strip the classification head'' construction --- L2-normalised:
+\begin{equation}
+\mathbf{z} = \mathrm{GAP}\big(\mathrm{MobileNetV2}_{\mathrm{body}}(\mathrm{norm}(\mathrm{crop}))\big),
+\quad \mathbf{e} = \mathbf{z}/\lVert\mathbf{z}\rVert_2
+\end{equation}
+The classifier logits are \emph{not} the reference space, and the extractor resolves the pooling layer
+at start-up by probing for a 1280-element output, failing startup if none exists. Reference vectors
+$\mathbf{r}_{k,j}$ are built offline from product crops by the same preprocessing, so references and
+live crops share one framing domain. Appearance similarity is the maximum cosine over that SKU's
+references:
+\begin{equation}
+s(k,\mathbf{e}) = \mathrm{clip}\!\left(\max_j\langle\mathbf{r}_{k,j},\mathbf{e}\rangle,-1,1\right)
+\end{equation}
+Colour evidence, when present, is an 80-bin HSV fingerprint: an $18\times4$ hue$\times$saturation
+histogram over \emph{chromatic} pixels ($S\ge90$, $V\ge60$) concatenated with an 8-bin brightness
+histogram over \emph{achromatic} pixels ($S<90$, $V\ge40$), so white, grey and dark packaging are
+distinguishable. With $\mathbf{h}(\cdot)$ the L2-normalised fingerprint,
+\begin{equation}
+c(k,\mathrm{crop}) = \mathrm{clip}\!\left(\max_j\langle\mathbf{h}_{k,j},
+  \mathbf{h}(\mathrm{crop})\rangle,0,1\right),\ \ \text{ok} \iff c\ge0.30
+\end{equation}
+and, if a SKU declares an expected mean BGR colour $\boldsymbol{\mu}_k$,
+\begin{equation}
+c_{\mathrm{bgr}} = 1-\frac{\lVert\mathrm{mean}(\mathrm{crop})-\boldsymbol{\mu}_k\rVert_2}{255\sqrt{3}},
+  \ \ \text{ok} \iff c_{\mathrm{bgr}}\ge0.30
+\end{equation}
+with the reported colour score the minimum of the two channels when both exist. Apparent shape
+evidence uses only the crop's aspect ratio against reference ratios $\rho_j$:
+\begin{equation}
+\alpha = \frac{\max(h,w)}{\min(h,w)},\quad
+\text{size\_ok} \iff \exists j:\max\!\left(\tfrac{\alpha}{\rho_j},\tfrac{\rho_j}{\alpha}\right)\le3.0
+\label{eq:aspect}
+\end{equation}
+\textbf{Equation~(\ref{eq:aspect}) is explicitly not a physical size measurement.} The camera is
+uncalibrated, with no depth channel and no known scale, so $\alpha$ is an image-plane ratio that
+varies with distance, pose and crop tightness. It is a weak consistency filter and is treated as such.
+
+\subsection{All-SKU competition and the burst-level veto}
+For each region all $|\mathcal{K}|$ SKUs are ranked by $s(k,\mathbf{e})$ with a deterministic
+tie-break on the SKU key. With $k_1$ the top-1 SKU, $s_1$ its score, $s_2$ the runner-up,
+$m=s_1-s_2$ and $k^*$ the scanned SKU:
+\begin{equation}
+\begin{cases}
+\textsc{mismatch}/\texttt{SWAP\_DETECTED} & k_1\neq k^* \wedge s_1\ge\theta_{\mathrm{swap}}{=}0.70\\
+\textsc{match} & k_1 = k^* \wedge s_1\ge\theta{=}0.72 \wedge m\ge\mu{=}0.04 \wedge \text{ok}\\
+\textsc{mismatch}/\texttt{LOW\_CONFIDENCE} & \text{otherwise}
+\end{cases}
+\end{equation}
+Aggregation over the burst is a \emph{lexicographic precedence}, not a vote:
+\begin{equation}
+\mathcal{P} = \begin{cases}
+\mathcal{S}\mathrm{w} & \mathcal{S}\mathrm{w}\neq\emptyset\\
+\mathcal{M} & \mathcal{S}\mathrm{w}=\emptyset,\ \mathcal{M}\neq\emptyset\\
+\mathcal{L} & \text{otherwise}
+\end{cases}
+\qquad \hat{r} = \arg\max_{r\in\mathcal{P}}\mathrm{score}(r)
+\label{eq:veto}
+\end{equation}
+Hence a single sufficiently confident alternate SKU anywhere in the burst overrides every matching
+region: an early, correct, hand-held view of the scanned product cannot certify a different object
+that was actually released. If no region produced a valid embedding the outcome is
+\textsc{unavailable}/\texttt{NO\_EMBEDDING}; if no region existed it is
+\textsc{mismatch}/\texttt{NO\_ITEM\_SEEN}. Algorithm~\ref{alg:verify} states the procedure.
+
+Note the asymmetry between $\theta_{\mathrm{swap}}=0.70$ and $\theta=0.72$: accusation is marginally
+\emph{easier} than approval. That is intentional in a fail-closed design, but it also means a
+near-threshold lookalike can produce a \texttt{SWAP\_DETECTED} against an honest shopper. The
+honest-shopper cost is \tbm{false \texttt{SWAP\_DETECTED} rate on genuine placements}.
+
+\begin{algorithm}[!t]
+\caption{Burst verification with all-SKU competition and veto}
+\label{alg:verify}
+\footnotesize
+\begin{algorithmic}[1]
+\Require scanned SKU $k^*$; per-frame region lists; reference DB over $\mathcal{K}$;
+         $\theta,\mu,\theta_{\mathrm{swap}}$
+\If{$k^*\notin\mathcal{K}$}
+  \State \Return \textsc{unavailable}(``no reference embeddings'') \EndIf
+\State $\mathcal{E},\mathcal{S}\mathrm{w},\mathcal{M},\mathcal{L}\gets[\,],[\,],[\,],[\,]$
+\For{each frame index $i$, each region index $j$}
+  \State $x\gets\mathcal{R}_i[j]$
+  \If{$x$ invalid \textbf{or} $\min(h,w)<8$}
+    \State record \textsc{unavailable}; \textbf{continue} \EndIf
+  \State $\mathbf{e}\gets\textsc{Normalise}(\textsc{Embed}(x))$
+    \Comment{single worker: \texttt{cv2.dnn} never re-entered}
+  \State $\mathrm{ranked}\gets\textsc{SortDesc}[(s(k,\mathbf{e}),c,\mathrm{ok},k):k\in\mathcal{K}]$
+    \Comment{EVERY SKU}
+  \State $(s_1,c_1,\mathrm{ok}_1,k_1)\gets\mathrm{ranked}[0]$;\ \
+         $s_2\gets\mathrm{ranked}[1].s$;\ \ $m\gets s_1-s_2$
+  \If{$k_1\neq k^*$ \textbf{and} $s_1\ge\theta_{\mathrm{swap}}$}
+    \State append to $\mathcal{S}\mathrm{w}$
+  \ElsIf{$k_1=k^*$ \textbf{and} $s_1\ge\theta$ \textbf{and} $m\ge\mu$ \textbf{and} $\mathrm{ok}_1$}
+    \State append to $\mathcal{M}$
+  \Else \State append to $\mathcal{L}$ \EndIf
+  \State record $(i,j,k_1,s_1,s(k^*),k_2,s_2,m,c_1,\mathrm{ok}_1)$ in $\mathcal{E}$
+\EndFor
+\State $\mathcal{P}\gets\mathcal{S}\mathrm{w}$ \textbf{or} $\mathcal{M}$ \textbf{or} $\mathcal{L}$
+  \Comment{Eq.~(\ref{eq:veto}): a confident swap vetoes every match}
+\State \Return $\arg\max_{r\in\mathcal{P}}\mathrm{score}(r)$ with $\mathcal{E}$, else
+       \textsc{unavailable}/\texttt{NO\_EMBEDDING}
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Independent mass verification}
+Two comparisons are made over the same physical signal. The firmware maintains a six-sample ring at
+${\sim}10$~Hz and declares
+\begin{equation}
+\mathrm{stable} \iff \mathrm{calibrated} \wedge |\mathrm{ring}|{=}6 \wedge
+  (\max\mathrm{ring}-\min\mathrm{ring}) \le \sigma = 4.0\,\mathrm{g}
+\label{eq:stable}
+\end{equation}
+publishing the window mean when stable and the instantaneous reading otherwise. On a Pi-supplied
+expectation it emits, once a stable reading deviates from the baseline by more than $5$~g,
+\begin{equation}
+\Delta_{\mathrm{ard}} = \mathrm{reading}-\mathrm{baseline\_g},\quad
+  \textsc{pass} \iff |\Delta_{\mathrm{ard}}-w_e| \le \mathrm{tol}
+\end{equation}
+Independently, the Pi's ledger requires
+\begin{equation}
+\Delta_{\mathrm{pi}} = g-\mathrm{anchor},\quad
+  \textsc{pass} \iff |\Delta_{\mathrm{pi}}-w_e| \le \mathrm{tol}
+\end{equation}
+A unit's mass gate becomes \textsc{pass} only when both hold; while the firmware verdict is
+outstanding the gate sits in \textsc{checking}, and a firmware \textsc{fail} is terminal and cannot be
+overwritten by a later pass. A missing verdict times out to \textsc{fail} after the 20~s ledger
+deadline and the firmware's own 20~s expectation timeout. This is redundancy of \emph{computation and
+of expectation plumbing}, not of sensing (Section~\ref{sec:limits}).
+
+\subsection{Does the configured window capture the physical insertion?}
+\label{sec:timing}
+This is the question the configuration most depends on, and it is answerable analytically from the
+shipped constants without any hardware. Let $t_0$ be mechanical impact and $t_q\ge t_0$ the moment
+the reading first enters a band of width $\le\sigma=4$~g and stays there. Because
+Eq.~(\ref{eq:stable}) requires six consecutive $100$~ms samples inside the band, the first sample that
+can be marked stable is the sixth, i.e.\ no earlier than $t_q+0.5$~s, and in practice
+$t_q+0.5\ldots0.6$~s depending on sample phase. The Pi stamps the sample on serial receipt, adding
+transmission and USB-CDC latency on the order of milliseconds. Writing
+$\Delta_s = t_s-t_0 = (t_q-t_0)+\Delta_{\mathrm{stab}}+\Delta_{\mathrm{serial}}$ with
+$\Delta_{\mathrm{stab}}\in[0.5,0.6]$~s:
+\begin{align}
+\text{descent inside the window} &\iff \Delta_s \le \delta_{\mathrm{pre}} = 0.40\,\mathrm{s}
+  \label{eq:c27}\\
+\text{baseline strictly pre-entry} &\iff \Delta_s < \delta_{\mathrm{base}} = 0.90\,\mathrm{s}
+  \label{eq:c28}
+\end{align}
+
+\textbf{Condition~(\ref{eq:c27}) is unsatisfiable with the shipped firmware}, because
+$\Delta_{\mathrm{stab}}$ alone exceeds $\delta_{\mathrm{pre}}$. The configured burst therefore does
+\emph{not} observe the product in flight; it observes the product \emph{at rest}, and possibly the
+hand withdrawing. This is not necessarily a defect --- a settled product is still foreground with
+respect to a pre-entry baseline, and the absence of the hand reduces occlusion --- but it has three
+consequences that must be stated rather than assumed away.
+
+First, the 16--17 frames of an admissible burst are \emph{near-duplicates} of one static scene.
+Density buys robustness against packet loss and shutter noise, not viewpoint diversity. Claims that
+depend on temporal diversity (for example, that a burst sees multiple faces of a package) are
+unsupported.
+
+Second, the margin before baseline contamination is thin. Combining~(\ref{eq:c28}) with
+$\Delta_s \ge \Delta_{\mathrm{stab}} \approx 0.5\ldots0.6$~s leaves roughly \textbf{0.30--0.40~s of
+mechanical decay budget}. Because the selected baseline is the newest frame at $t_s-0.90$~s, once
+$\Delta_s>0.90$~s the baseline itself already contains the product at rest; the difference mask then
+collapses and the system emits \textsc{mismatch}/\texttt{NO\_ITEM\_SEEN} --- a \textbf{false reject
+with a misleading reason code}, not a timeout.
+
+Third, the self-consistent operating band for the current configuration is
+\begin{equation}
+0.40\,\mathrm{s} < \Delta_s < 0.90\,\mathrm{s}
+\label{eq:band}
+\end{equation}
+which must be verified empirically for the actual mechanism, product mass range and mounting
+stiffness: \tbm{distribution of $\Delta_s$ over $\ge200$ drops, per mass decile, on the mounted
+cart}. If the upper tail crosses $0.90$~s, the correct responses are to widen $\delta_{\mathrm{base}}$
+(and $T_{\mathrm{buf}}$ accordingly), to reduce $\Delta_{\mathrm{stab}}$ by raising the HX711 sample
+rate or shortening the stability window at the cost of noise immunity, or to add a \emph{separately
+defined impact timestamp} --- for example a first-derivative threshold crossing published alongside the
+settled sample. Lowering the confidence thresholds to compensate for missing evidence is explicitly
+not an acceptable response, because it trades a false reject for a false accept. Fig.~\ref{fig:timing}
+shows the regimes.
+
+\begin{figure}[!t]
+\centering
+% \includegraphics[width=\columnwidth]{fig2_timing}
+\figplaceholder{\textbf{Fig.~2 placeholder.} Draw in TikZ from the coordinate specification in the
+supplementary artifacts file: axis $-1.05$ to $+0.90$~s relative to $t_s$; baseline search window
+$[-1.05,-0.90]$; burst window $[-0.40,+0.15]$ with 17 ticks at $33.3$~ms; transport-grace deadline
+$+0.90$; and the $t_{\mathrm{impact}}$ uncertainty bar spanning $0.5$--$0.9$~s left of the origin.
+Shade the band of Eq.~(\ref{eq:band}).}{48mm}
+\caption{Settlement-triggered burst timing at the configured defaults. $t_{\mathrm{impact}}$ lies
+$0.5$--$0.9$~s before $t_s$, i.e.\ the descent happens \emph{before} the window opens. Region~I
+($\Delta_s\le0.40$~s, descent captured) is unreachable with the shipped firmware; Region~II
+($0.40<\Delta_s<0.90$~s) is the valid at-rest band; Region~III ($\Delta_s\ge0.90$~s) contaminates the
+baseline and yields a mislabelled false reject.}
+\label{fig:timing}
+\end{figure}
+
+\subsection{Outcome codes and their consequences}
+Table~\ref{tab:codes} lists the implemented outcomes. Two implementation details deserve explicit
+statement because they are not obvious from the documentation. First, \texttt{NO\_ITEM\_SEEN} is
+tested \emph{before} \texttt{SCENE\_CHANGED}: if \emph{every} frame in a burst is refused as a global
+scene change, the region count is zero and the result is \textsc{mismatch}/\texttt{NO\_ITEM\_SEEN},
+not \textsc{retry}/\texttt{SCENE\_CHANGED}. Anyone interpreting the diagnostic manifests should
+therefore read \texttt{NO\_ITEM\_SEEN} as ``no usable foreground region was isolated anywhere in the
+burst'', a class that includes the total-illumination-change case; the per-frame \texttt{rejected}
+field in the manifest distinguishes the two causes. The safety direction is identical either way ---
+both paths refuse. Second, the Pi collapses the four-valued image verdict to a binary gate ---
+\textsc{pass} only for \textsc{match} with \texttt{approved} true, \textsc{fail} otherwise --- so
+\textsc{retry} and \textsc{unavailable} are \emph{not} retried automatically; the shopper's recovery
+path is selected removal and re-scan, which creates a fresh transaction with an incremented attempt.
+Both behaviours are recorded here as observed properties of the evaluated revision. No change to
+either is proposed in this paper.
+
+\begin{table}[!t]
+\caption{Verdict and reason codes, as implemented, with their effect on the Pi.}
+\label{tab:codes}
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}p{0.20\columnwidth}p{0.14\columnwidth}p{0.56\columnwidth}@{}}
+\toprule
+Code & Verdict & Produced when / effect \\
+\midrule
+\texttt{MATCH} & \textsc{match} & Target top-1 above $\theta$ with margin $\ge\mu$ and colour/size
+  ok, and no swap anywhere in the burst. $V_c\gets\textsc{pass}$ \\
+\texttt{SWAP\_DETECTED} & \textsc{mismatch} & An alternate SKU scored $\ge\theta_{\mathrm{swap}}$;
+  takes precedence over all matches. $V_c\gets\textsc{fail}$, reason carries the observed SKU \\
+\texttt{LOW\_CONFIDENCE} & \textsc{mismatch} & Regions exist but none qualifies.
+  $V_c\gets\textsc{fail}$ \\
+\texttt{NO\_ITEM\_SEEN} & \textsc{mismatch} & \emph{No} foreground region in any burst frame; also
+  reached when every frame was refused. $V_c\gets\textsc{fail}$ \\
+\texttt{SCENE\_CHANGED} & \textsc{retry} & At least one frame yielded regions \emph{and} at least one
+  was refused. $V_c\gets\textsc{fail}$ \\
+\texttt{INFERENCE\_ERROR} & \textsc{unavailable} & The matcher raised inside the worker \\
+\texttt{NO\_EMBEDDING} & \textsc{unavailable} & Regions existed but none produced a valid embedding \\
+(text reason) & \textsc{retry} & Missing baseline; sparse or gapped burst; stale settlement; identity
+  mismatch; queue full; camera restart; inference deadline; settlement never arrived \\
+(text reason) & \textsc{unavailable} & Scanned barcode/SKU not in the embedding database \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Concurrency, cancellation and liveness}
+All ROS callbacks run in the default mutually-exclusive callback group; all segmentation, inference
+and diagnostic disk writes run on a \emph{single} worker thread, so \texttt{cv2.dnn} is never entered
+concurrently and camera/heartbeat callbacks never block behind inference. No worker publishes or
+mutates node state: results are collected on the 20~Hz timer. The frame ring, the in-flight map
+($\le8$) and the completed-key cache ($\le4096$, FIFO-evicted) are all bounded.
+
+Cancellation is handled at three points, each covered by a regression test: a \texttt{cancel} action
+removes pending and collecting entries and marks a running future expired; an expired future's result
+is discarded when it completes; and a verdict for an already-completed key is suppressed. A camera
+generation change invalidates everything in flight. Heartbeats continue during inference and tolerate
+a camera age up to $5.0$~s even after old frames have been pruned, so a brief delivery stall does not
+invalidate already-verified units --- but a genuine camera restart does, via
+\texttt{/cart/scene\_anomaly}.
+
+Fig.~\ref{fig:seq} summarises one successful placement end to end.
+
+\begin{figure}[!t]
+\centering
+% \includegraphics[width=\columnwidth]{fig3_sequence}
+\figplaceholder{\textbf{Fig.~3 placeholder.} Export the Mermaid \texttt{sequenceDiagram} from the
+supplementary artifacts file. Six participants: scanner camera, authority, firmware, verification
+camera, verifier, touchscreen.}{44mm}
+\caption{Message sequence for one successful placement. A barcode scan creates verification context
+but never starts inference; the PC logs it and waits. Inference begins only on
+\texttt{/cart/placement\_settled}. The PC does not snapshot on the settlement callback, because
+post-event frames may not yet have arrived and the two topics may be delivered out of order.}
+\label{fig:seq}
+\end{figure}
+
+%---------------------------------------------------------------------
+\section{Implementation}
+\label{sec:impl}
+
+The system was inspected and tested at repository revision
+\texttt{28aa58d3ceff6a7d03a2d208d9d4065606af85f8} (11~October~2026). All statements in this section
+derive from the launched source and configuration at that revision.
+
+\subsection{Hardware and software inventory}
+HX711 with DT$\rightarrow$pin~3 and SCK$\rightarrow$pin~2 at $115200$~baud~\cite{R74}; the
+\texttt{bogde/HX711} Arduino library~\cite{R75}; calibration persisted as an EEPROM
+record~\cite{R79} via \texttt{ZERO} then \texttt{CAL,<grams>}, each averaging ten raw reads, with no
+auto-tare at boot. Stability uses $\mathrm{WINDOW}{=}6$ samples,
+$\mathrm{STABLE\_SPAN\_G}{=}4.0$~g and ${\sim}100$~ms sample gating; the firmware trigger is
+$\mathrm{CHANGE\_G}{=}5.0$~g. Load-cell capacity, class and excitation are deployment choices not
+fixed by the code. Both hosts run Ubuntu~24.04 with ROS~2 Jazzy,
+\texttt{ROS\_DOMAIN\_ID=42} and \texttt{rmw\_cyclonedds\_cpp} on a shared trusted LAN with DDS
+UDP/multicast permitted. The scanner camera is a USB webcam at $640\times480$ with
+\texttt{BUFFERSIZE=1} under V4L2, decoded with pyzbar/ZBar~\cite{R78}; the verification camera is a
+USB webcam at $640\times480$ and $30$~FPS \emph{requested} (the driver-reported rate is logged at
+open; no MJPG FourCC is requested, so raw-format USB bandwidth may limit the achieved rate):
+\tbm{achieved frame rate}. Exact Pi model, RAM, PC CPU and RAM: \tbr{host specifications}.
+
+The model is MobileNetV2~\cite{R31}, \texttt{mobilenetv2-7.onnx} from the ONNX model zoo
+(torchvision export, opset~7, ${\approx}13.9$~MB), with the 1280-D GAP output resolved at start-up by
+probing; preprocessing is $224\times224$, BGR$\rightarrow$RGB, $/255$, mean $(0.485,0.456,0.406)$,
+std $(0.229,0.224,0.225)$, NCHW --- identical in the offline database builder and the live matcher.
+Inference uses \texttt{cv2.dnn.readNetFromONNX} with \texttt{ENGINE\_CLASSIC} where available,
+\texttt{DNN\_BACKEND\_OPENCV} and \texttt{DNN\_TARGET\_CPU}~\cite{R77}; there is no GPU, no ONNX
+Runtime and no remote API in the live path. The colour fingerprint is the 80-bin format of
+Section~\ref{sec:method} at format version~2; a stale colour format disables colour, which makes the
+verifier \emph{stricter}, never laxer. The catalogue is read-only SQLite validated on every lookup,
+and scanner-supplied price/name fields are \emph{not} trusted. Durable state is SQLite WAL with
+\texttt{synchronous=FULL}. Payment is a locally generated, revision-gated
+\texttt{upi://pay?pa\&pn\&am\&cu=INR} QR~\cite{R80} --- \textbf{a payment request, not a
+provider-confirmed settlement}.
+
+\subsection{Configured parameters}
+Table~\ref{tab:params} lists the configured defaults. Internal consistency is enforced at start-up
+rather than trusted: the node refuses to launch unless all durations are finite and positive, all
+counts are positive integers, $\delta_{\mathrm{base}}>\delta_{\mathrm{pre}}$,
+$T_{\mathrm{buf}}>\delta_{\mathrm{base}}+\delta_{\mathrm{post}}+T_{\mathrm{grace}}$,
+$n_{\min}\ge2$, $N_{\mathrm{buf}}\ge n_{\min}$, $0\le p\le0.5$, $0<\rho<1$ and $\tau_d\le255$. With
+the shipped values $T_{\mathrm{buf}}=4.0>1.80$ and $N_{\mathrm{buf}}=120=4.0\,\mathrm{s}\times30$~FPS,
+so the ring is exactly sized for the configured window at the requested frame rate --- a 15~FPS camera
+would halve ring occupancy and \emph{fail} the density test rather than silently degrade.
+
+\begin{table}[!t]
+\caption{Configured defaults. These require empirical validation; none is an optimised or
+experimentally justified value.}
+\label{tab:params}
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.1}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Group & Parameter & Value & Controls \\
+\midrule
+\multirow{6}{*}{Thresholds}
+ & \texttt{similarity\_threshold} $\theta$ & 0.72 & min.\ top-1 cosine \\
+ & \texttt{competitive\_margin} $\mu$ & 0.04 & min.\ top-1 $-$ runner-up \\
+ & \texttt{swap\_threshold} $\theta_{\mathrm{swap}}$ & 0.70 & swap accusation \\
+ & \texttt{colour\_threshold} & 0.30 & min.\ colour score \\
+ & \texttt{size\_ratio\_tolerance} & 3.0 & apparent aspect ratio \\
+ & \texttt{removal\_margin} & 0.04 & open-SKU removal margin \\
+\midrule
+\multirow{2}{*}{Buffer}
+ & \texttt{buffer\_seconds} & 4.0 s & ring retention \\
+ & \texttt{buffer\_max\_frames} & 120 & ring capacity \\
+\midrule
+\multirow{7}{*}{Burst}
+ & \texttt{burst\_before} $\delta_{\mathrm{pre}}$ & 0.40 s & window start \\
+ & \texttt{burst\_after} $\delta_{\mathrm{post}}$ & 0.15 s & window end \\
+ & \texttt{baseline\_before} $\delta_{\mathrm{base}}$ & 0.90 s & baseline target \\
+ & \texttt{baseline\_tolerance} $\delta_{\mathrm{tol}}$ & 0.15 s & baseline search \\
+ & \texttt{burst\_min\_frames} $n_{\min}$ & 12 & density test \\
+ & \texttt{burst\_max\_gap} $g_{\max}$ & 0.08 s & gap test (edges incl.) \\
+ & \texttt{transport\_grace} $T_{\mathrm{grace}}$ & 0.75 s & late-delivery wait \\
+\midrule
+\multirow{4}{*}{Foreground}
+ & \texttt{difference\_threshold} $\tau_d$ & 25 & per-channel threshold \\
+ & \texttt{foreground\_min\_area} $A_{\min}$ & 800 px & min.\ contour area \\
+ & \texttt{roi\_padding} $p$ & 0.12 & ROI padding \\
+ & \texttt{max\_roi\_fraction} $\rho$ & 0.65 & refusal fractions \\
+\midrule
+\multirow{5}{*}{Scheduling}
+ & \texttt{camera\_loss\_timeout} & 5.0 s & heartbeat frame age \\
+ & \texttt{settlement\_timeout} & 18.0 s & pending-context wait \\
+ & \texttt{result\_timeout} & 6.0 s & inference deadline \\
+ & \texttt{max\_inflight} & 8 & concurrent verifications \\
+ & \texttt{debug\_keep} & 100 & retained diagnostics \\
+\midrule
+\multirow{5}{*}{Pi ledger}
+ & \texttt{verification\_timeout} & 20.0 s & per-unit deadline \\
+ & \texttt{sensor\_timeout} & 2.5 s & scale/heartbeat freshness \\
+ & \texttt{noise\_g} & 5.0 g & mass-step noise gate \\
+ & \texttt{empty\_tolerance\_g} & 10.0 g & empty/reconciliation \\
+ & \texttt{max\_units} & 200 & cart capacity \\
+\midrule
+Scanner & \texttt{rearm\_seconds} & 0.8 s & observed absence to re-arm \\
+\midrule
+\multirow{3}{*}{Firmware}
+ & \texttt{WINDOW} & 6 & stability ring length \\
+ & \texttt{STABLE\_SPAN\_G} $\sigma$ & 4.0 g & stability span \\
+ & \texttt{CHANGE\_G} & 5.0 g & firmware trigger \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Scan admission}
+Repeated scans of the same code are gated by \emph{observed absence}, not by a timer: a code re-arms
+only after being continuously absent from the decoder output for $0.8$~s. A camera outage calls an
+explicit gap handler that resets absence timers, so an outage can never be mistaken for the code
+leaving view --- otherwise unplugging the scanner camera while holding a code would re-arm it. If more
+than one code is visible simultaneously, no scan is emitted and the shopper is asked to present one
+code at a time.
+
+\subsection{Diagnostic artifacts}
+Each worker evaluation writes, to a UUID-named directory, the baseline image, every evaluated full
+frame, every ROI and a \texttt{manifest.json} containing source timestamps, window bounds, bounding
+boxes, per-region target/top-1/runner-up scores, margins, colour scores, evidence flags, verdicts and
+reason codes. Retention is bounded to 100 transactions, and \emph{only} directories matching the
+writer's own \texttt{nxtcart\_<UTC>\_<32-hex>} pattern are eligible for deletion; symlinked
+directories are never followed and the parent is re-resolved immediately before recursive removal. A
+full or unwritable disk is reported as an explicit error and \emph{cannot} change the decision --- a
+regression test asserts that a \textsc{mismatch} cannot become a \textsc{match} because diagnostics
+failed. These artifacts are the intended instrument for the measurement campaign and are why
+Section~\ref{sec:timing} is empirically checkable: the manifest records \texttt{settled\_ns},
+\texttt{window\_start\_ns}, \texttt{window\_end\_ns}, \texttt{baseline\_ns}, the realised frame count
+and the realised maximum gap for every transaction. They are \textbf{diagnostic model outputs, not
+labelled ground truth}, and a later cancellation or timeout can suppress publication of a verdict
+whose artifacts were already written.
+
+\subsection{Clock synchronisation assumptions}
+Both camera stamps and settlement stamps originate on the \emph{Pi} clock; the PC compares them
+against its \emph{own} ROS clock to compute ages and uses its monotonic clock only for scheduling and
+retention. The deployment therefore requires NTP/chrony synchronisation, and simulated time must never
+be mixed with wall-clock sensor stamps. Skew is not silently absorbed: a settlement stamp outside
+$[-0.1,4.0]$~s returns \textsc{retry} naming clock synchronisation, and a frame outside
+$[-0.5,5.0]$~s is dropped. The residual exposure is a \emph{slowly} accumulating skew smaller than
+those windows, which would bias baseline and burst selection without triggering any guard:
+\tbm{Pi$\leftrightarrow$PC offset and drift over a shopping session}.
+
+\subsection{Deployment-boundary enforcement and retained code}
+The test runner parses every Python source on both hosts and fails the build if the Pi package imports
+\texttt{ml}, \texttt{torch}, \texttt{tensorflow}, \texttt{onnxruntime} or \texttt{nxtcart\_vision}, or
+if the PC package imports \texttt{smart\_cart}; it also asserts that the two copies of
+\texttt{smart\_cart\_interfaces} are byte-identical. The architectural split is thus a checked
+invariant rather than a convention.
+
+The repository deliberately retains historical material that the integrated runtime does \emph{not}
+launch, and this must be stated to avoid architectural confusion. The PC package's console entry
+points are exactly \texttt{vision\_verify\_node} and \texttt{capture\_references}, and
+\texttt{vision\_verify\_node} imports only the matcher and burst modules. Consequently the MOG2 motion
+detector, the three-window ``journey'' verifier, the geometric tracking pipeline, the zone/custody/
+identity trackers, the legacy suites, the vision-API backend utilities and the JPEG-carrying
+\texttt{CameraFrame} message are \emph{not part of the live path}. Three Pi modules are retired stubs
+that raise on invocation. Two documentation artifacts remain stale at this revision and are superseded
+by the current vision guide: the top-level README's description of ``3--5 full-frame motion views'',
+and the setup guide's JPEG transport, region parameters, nine-frame scan-to-rest journey and
+vision-API backend. Readers reproducing this work should resolve any architectural question from the
+verification configuration, the two launch files and the three live PC modules.
+
+%---------------------------------------------------------------------
+\section{Experimental Design and Evaluation Protocol}
+\label{sec:eval}
+
+No part of this protocol has been executed. It is specified at a level intended to be directly
+runnable, and every table it produces is left with explicit placeholders.
+
+\subsection{Ground-truth units and denominators}
+Three nested units of analysis, each with its own denominator, must be reported separately; reporting
+only the first is the most common error in this literature. \emph{Region/frame level}: one evaluated
+ROI, denominator = ROIs reaching the matcher; useful only for diagnosing the visual channel, and
+\emph{not} the system's output. \emph{Transaction level}: one $(\tau,a)$ attempt, denominator =
+attempts of the relevant class; the natural unit for false accept/reject. \emph{Session level}: one
+complete trip ending in a checkout decision, denominator = sessions; the unit that matters
+commercially, because the system's output is a bill. Ground truth is recorded by a human operator
+independently of the system --- true SKU, true physical action, true mass on a reference scale,
+intended scenario class and wall-clock time --- and joined to logs by $(\tau,a)$ \emph{after} the
+session, never by trusting the system's own identification.
+
+\subsection{Baselines}
+All baselines run on the same physical placements and the same recorded evidence, so differences
+reflect the decision rule rather than the trial set. \textbf{B0} barcode only: bill every accepted
+scan. \textbf{B1} barcode + weight: require both mass checks, ignore all image evidence; reproduces
+the family of~\cite{R02}. \textbf{B2} barcode + vision: require the image gate, accept any mass.
+\textbf{B3} full system: conjunctive gates plus global reconciliation and the checkout predicate.
+\textbf{B4} fused score (contrast): replace the conjunction with a weighted sum of a mass-consistency
+score and the visual score, argmax above a threshold, in the style of~\cite{R01}. B4 is important for
+honesty: the conjunctive design is a \emph{hypothesis}, and the experiment must be able to show that
+fusion would have been better.
+
+\subsection{Ablations of the claimed mechanisms}
+Each ablation removes exactly one mechanism from B3, replaying the \emph{same} recorded bursts offline
+so only the decision changes. \textbf{A-FG}: embed the full frame instead of foreground ROIs
+(tests contribution~3). \textbf{A-ALL}: score only the scanned SKU, threshold absolutely (4).
+\textbf{A-VETO}: keep all-SKU scoring but let any \textsc{match} win (4). \textbf{A-MARGIN}: set
+$\mu{=}0$. \textbf{A-COLOUR}: disable colour and aspect. \textbf{A-DENSITY}: accept any burst with
+$\ge1$ frame and no gap test (2). \textbf{A-BASE}: use the frame immediately before settlement as
+baseline. \textbf{A-SAMPLE}: decimate the burst to five evenly spaced frames. \textbf{A-TRIG}: trigger
+on the scan with a fixed forward window instead of on settlement (2). The retired full-frame and
+journey-based pipelines may be evaluated \emph{only} as separately identified experiments, re-run under
+the same conditions on the same recorded data; their historical development numbers are not comparable
+and are not reported as results.
+
+\subsection{Scenario matrix}
+Table~\ref{tab:scen} abridges the matrix; the full 29-row version is in the supplementary material.
+``In scope'' means the current code has an implemented, unit-tested handling path; it does \emph{not}
+mean the handling has been validated on hardware. Each scenario requires at least 30 genuine
+placements per SKU plus deliberately chosen confusable pairs, over an empty and a partly filled
+basket, all relevant orientations, normal shopping speed and the real store LAN. Thirty placements per
+cell is an initial bench set, \emph{not} statistical certification: with 30 trials and zero observed
+failures the one-sided $95\,\%$ Clopper--Pearson upper bound on the failure rate is still
+approximately $9.5\,\%$, which must be stated whenever a cell reads ``0 failures''.
+
+\begin{table}[!t]
+\caption{Scenario matrix (abridged). Out-of-scope rows are retained deliberately.}
+\label{tab:scen}
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}p{0.04\columnwidth}p{0.40\columnwidth}p{0.36\columnwidth}p{0.10\columnwidth}@{}}
+\toprule
+\# & Scenario & Expected behaviour & Scope \\
+\midrule
+S1 & Correct product, correct mass, clear view & \textsc{match} + mass \textsc{pass} & Yes \\
+S2 & Correct product, wrong mass & Mass \textsc{fail}; image cannot clear it & Yes \\
+S3 & Equal-mass different SKU & Mass may pass; \texttt{SWAP\_DETECTED} expected & Yes \\
+S4 & Lookalike variant, same brand & Swap or low confidence; never \textsc{match} & Yes \\
+S5 & Unscanned insertion & Unassigned-mass issue latches & Yes \\
+S6--S8 & Duplicate scan; two scans before settling; two objects together & Ambiguous; no attribution attempted & Yes \\
+S9 & Selected removal of the correct unit & Removed only after both removal gates & Yes \\
+S10 & Select expensive row, remove cheap equal-mass item & Removal identity mismatch; no discount & Yes \\
+S11--S15 & Hands, shadows, blur, partial occlusion, global lighting change & Refusal or low confidence; never a false \textsc{match} & Yes \\
+S16 & \textbf{Fully occluded substitution} & \textbf{Cannot be resolved; must remain unverified} & \textbf{No} \\
+S17--S19 & Dropped frames; camera stall 1--4 s; camera restart & \textsc{retry}; verified units preserved; mandatory reconciliation & Yes \\
+S20 & Settlement delay beyond $0.90$~s & Baseline contamination $\rightarrow$ false reject & Yes (the failure \emph{is} the measurement) \\
+S21 & Scale drift across a session & Anchor advances per attributed step & Partial (no drift compensation) \\
+S22--S27 & Cart pushed; cancel mid-verification; duplicate/late messages; authority restart; PC stopped; Arduino unplugged & Withhold, idempotent, fail closed; no fake approval & Yes \\
+S28 & Items below the mass noise floor & Mass gate cannot discriminate & \textbf{No} \\
+S29 & Loose produce / variable-weight goods & Not supported by the catalogue schema & \textbf{No} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Metrics}
+Table~\ref{tab:metrics} states each metric with its denominator. The risk--coverage curve is the
+honest way to report a system that may abstain~\cite{R61}, and thresholds should be reported as a
+curve rather than a single operating point. Because cosine similarity is not a calibrated
+probability~\cite{R60}, no row should be presented as a confidence or a probability of correctness.
+
+\begin{table}[!t]
+\caption{Metrics, each with its denominator stated.}
+\label{tab:metrics}
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}p{0.34\columnwidth}p{0.30\columnwidth}p{0.28\columnwidth}@{}}
+\toprule
+Metric & Definition & Denominator \\
+\midrule
+False accept rate & Adversarial attempts reaching \textsc{verified} & Adversarial attempts of that class \\
+Honest false reject rate & Honest attempts flagged on first attempt & Honest attempts \\
+Retry rate & Attempts ending \textsc{retry}/\textsc{unavailable} & All attempts (reported \emph{separately} from rejects) \\
+Intervention rate & Sessions needing reconciliation or staff action & Sessions \\
+Exact basket / total correctness & Final billed multiset / total equals ground truth & Sessions \\
+Substitution detection rate & Swap attempts yielding \texttt{SWAP\_DETECTED} with the \emph{correct} observed SKU & Swap attempts \\
+False accusation rate & Honest attempts yielding \texttt{SWAP\_DETECTED} & Honest attempts \\
+Verification latency (p50/p95) & $t_{\mathrm{verdict}}-t_s$ & Attempts producing a verdict \\
+End-to-end latency (p50/p95) & $t_{\mathrm{verdict}}-t_{\mathrm{scan}}$ & As above (reported \emph{in addition}) \\
+Achieved rate / gap distribution & From manifest realised counts and gaps & Admissible + inadmissible bursts \\
+Burst admissibility rate & Bursts passing the density and gap tests & Settlement events \\
+Settlement delay $\Delta_s$ & $t_s - t_{\mathrm{impact}}$ via an independent reference & Drops \\
+Mass error & Measured delta $-$ reference-scale mass & Placements \\
+Resource use / network & CPU, RSS, ms per ROI; bytes/s on the wire & Sampled \\
+Risk--coverage curve & FAR vs fraction decided, as $(\theta,\mu,\theta_{\mathrm{swap}})$ vary & Attempts \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Tuning/test separation and leakage controls}
+Thresholds, colour and aspect tolerances and all burst timings are tuned on a \emph{development}
+split and frozen before the test campaign; the frozen values are reported. Reference photographs,
+tuning data and test data come from \emph{disjoint capture sessions}, disjoint \emph{physical units}
+of each product and disjoint lighting conditions. Adjacent frames from the same burst must never be
+split across tuning and test --- the unit of partition is the \emph{capture session}, never the frame.
+Sixteen near-duplicate frames from one burst carry roughly one burst's worth of independent
+information (Section~\ref{sec:timing}), so treating frames as independent samples would inflate every
+interval. Lookalike and equal-mass pairs are selected and held out \emph{before} any tuning. Each
+reported figure states the number of sessions, attempts and physical units contributing to it, with
+Clopper--Pearson intervals for proportions.
+
+\subsection{Instrumentation plan}
+An independent impact reference is required to measure $\Delta_s$; a contact microphone or
+accelerometer on the basket, logged on the Pi clock, is sufficient and need not be part of the
+product. Ground truth for identity comes from the operator's log; the visual channel's own manifest
+provides per-region diagnostics but must not be used as its own ground truth. Wire bandwidth is
+measured with a packet counter on the PC interface, not inferred from~(2).
+
+%---------------------------------------------------------------------
+\section{Results and Discussion}
+\label{sec:results}
+
+\subsection{What was actually measured}
+The only completed measurements are host-independent software checks, executed at revision
+\texttt{28aa58d} on Windows~11 with Python~3.14.7, OpenCV~5.0.0 and NumPy~2.5.2 --- a development
+host, \emph{not} the ROS Jazzy target. Source parse, package XML, interface parity and
+deployment-boundary checks: \textbf{PASS} (85 Python sources parsed; both interface copies
+byte-identical; no boundary violation). Integration and regression suites: \textbf{103 tests, OK}.
+Reference-handling suite: \textbf{4 tests, OK}. Scripted verifier suite: \textbf{all checks passed}.
+
+Of the 103 tests, 35 exercise the current burst pipeline directly (8 foreground-segmentation tests
+using real OpenCV, 6 all-SKU/veto ranking tests, 18 node-level burst/cancellation/health tests, 3
+camera-node tests), 26 exercise the Pi ledger, 11 the audit regressions, 4 the ROS adapters, 2 the
+catalogue and serial contracts, 9 the matcher's database handling and 4 the Pi scan/verdict binding.
+\textbf{Twelve tests target retired components} (4 journey-window, 5 geometric-merge calibration, 3
+MOG2 motion) and are not evidence about the current pipeline.
+
+\subsection{What these results do and do not establish}
+They establish that the source parses, that the two hosts' message contracts are identical, that the
+deployment boundary holds, and that the implemented decision logic behaves as specified on constructed
+inputs --- including that an empty scene and a global lighting change never invoke the embedding
+matcher, that a four-frame packet-loss gap returns \textsc{retry} rather than a decimated decision,
+that a later confident swap vetoes an earlier match while every region is still evaluated, that a
+cancelled or over-deadline job cannot publish an approval, and that a diagnostic disk failure cannot
+upgrade a \textsc{mismatch} to a \textsc{match}.
+
+They establish \textbf{nothing} about live DDS behaviour or wire latency (ROS callbacks are driven
+through message-schema stubs and a patched clock); achieved camera frame rate; recognition accuracy on
+real packaging; HX711 accuracy, linearity, creep or drift on a mounted basket; the distribution of
+$\Delta_s$; native \texttt{colcon} builds; Arduino compilation; or any security property. Neither
+\texttt{colcon} nor the Arduino toolchain was available on the development host, so both native builds
+remain required bring-up steps rather than completed validations. The test environment's OpenCV~5.0.0
+also exceeds the \texttt{>=4.10,<5} range pinned for the ROS target, so the suites were exercised
+against a newer DNN stack than the deployment one.
+
+\subsection{Discussion}
+\textbf{Foreground-only inference removes a specific failure mode and introduces another.} By
+construction no basket background reaches the network, so the matcher cannot score a scene against a
+SKU and the ``empty basket scores against the target'' pathology that motivated the design is
+structurally impossible --- a regression test pins exactly that case. The cost is that the method's
+entire sensitivity now rests on the quality of one baseline frame. Baseline differencing cannot
+distinguish a product from a hand holding it, cannot see a fully occluded object, and degrades under
+shadows, reflections and any scene change between baseline and burst. The refusal rules convert those
+degradations into refusals rather than confident errors --- the right safety direction --- but refusals
+have a shopper cost that is \tbm{honest retry rate}.
+
+\textbf{All-SKU competition is a contrastive device, not an identification claim.} Requiring the
+scanned SKU to be top-1 with a margin is strictly stronger than an absolute threshold, and the margin
+is what makes a lookalike pair expensive to pass. But the open-set evidence from the closest
+methodological comparator is sobering: a stronger pipeline than ours reports $67.5\,\%$ Precision@1 at
+only 40 classes, with errors concentrated on visually similar products~\cite{R07}. We should therefore
+expect our top-1 ranking to be unreliable as a catalogue grows, and $\theta_{\mathrm{swap}}=0.70$ to
+generate false accusations on honest lookalike placements. This is the sharpest open risk in the
+design, it is measurable (Table~\ref{tab:metrics}), and it is why the paper does not present the veto
+as a solved mechanism.
+
+\textbf{Independence costs coverage and is the point.} Refusing to let a visual match offset a mass
+failure guarantees that the attack class the mass channel \emph{can} see is never argued away by the
+channel that cannot. The symmetric cost is that two independent gates multiply their false-reject
+rates, so B3 will have a strictly higher honest-retry rate than either B1 or B2. B4 exists precisely so
+that this trade can be measured rather than asserted.
+
+\textbf{Weight-triggered selection is prior art; retrospective selection is the variation.} Triggering
+detection on a stabilised weight change is already done~\cite{R01}. What differs here is that the
+trigger does not start a capture --- it selects, from history, a window that \emph{already contains}
+the event, along with a baseline from before it, and refuses when that window is not complete.
+Section~\ref{sec:timing} shows that this variation is what makes the configuration auditable: because
+the window is explicit and the manifest records what was realised, the mismatch between the settlement
+timestamp and mechanical impact is \emph{visible in the data} instead of silently shaping the evidence.
+
+\textbf{The settlement-timing result is the most consequential finding of this paper}, and it is
+analytical rather than empirical. With the shipped firmware the system cannot observe the descent; it
+observes the settled product, over near-duplicate frames, with roughly $0.30$--$0.40$~s of decay
+budget before the baseline is contaminated and the system emits a mislabelled false reject. Any
+deployment of this configuration must measure $\Delta_s$ first. A reader who takes one engineering
+lesson from this manuscript should take this one: in an event-triggered perception system, the
+\emph{semantics} of the trigger timestamp --- stable-sample versus impact --- silently determines what
+the evidence window contains.
+
+%---------------------------------------------------------------------
+\section{Limitations and Threats to Validity}
+\label{sec:limits}
+
+\textbf{No empirical validation of the primary claims.} Every accuracy, latency, resource, cost and
+loss-reduction figure is pending. Static code inspection is not proof of successful hardware
+operation, and a passing unit-test suite over constructed inputs is not evidence about real packaging,
+real lighting or real middleware.
+
+\textbf{A narrow visual match is not end-to-end theft prevention.} The visual gate establishes, at
+best, that \emph{some} foreground region in a settled-mass window was consistent with the scanned SKU
+under a cosine threshold and a competitor margin. It does not establish that no other object entered
+the basket, that the matched region is the object that caused the mass change, or that an occluded
+exchange did not occur. Scenario~S16 is explicitly out of scope and must remain unresolved rather than
+resolved optimistically.
+
+\textbf{The two mass checks are not independent sensors.} They are computed by different processors
+from different baselines with different code paths, which protects against a software fault or a stale
+expectation on one side. They read the \emph{same load cell through the same HX711}. A mechanical
+fault, a load path bypassing the cell, a calibration error or an ADC fault defeats both
+simultaneously. Describing this as sensor redundancy would be wrong.
+
+\textbf{Apparent size is not physical size.} Equation~(\ref{eq:aspect}) uses an image-plane aspect
+ratio from an uncalibrated monocular camera with no depth channel. It cannot bound physical
+dimensions, and no claim depends on it beyond a weak consistency filter.
+
+\textbf{Single aggregate load cell.} Concurrent placements cannot be attributed. The system flags them
+as ambiguous, which is correct but is a \emph{capability limit}, not a solution. Multiple cells are
+planned, not implemented.
+
+\textbf{Security and payment.} The cart LAN is assumed trusted; DDS security is not enabled, so topic
+injection by a host on the same domain is not prevented. A single forged verdict whose $(\tau,a)$ and
+barcode match a pending unit would be accepted. Transaction and attempt binding provides \emph{replay}
+resistance but not authentication. On payment: the system generates a revision-gated UPI deep-link
+QR~\cite{R80}. \textbf{Generating a payment request is not confirmed settlement.} A displayed static
+QR cannot revoke a screenshot already taken and cannot prove that money moved. Unattended commercial
+checkout additionally requires provider-side order authorisation and a confirmed-settlement webhook,
+neither of which exists in this code.
+
+\textbf{Thresholds are unvalidated defaults.} The nine decision thresholds in Table~\ref{tab:params}
+were chosen during development. None is derived from an operating-characteristic analysis on held-out
+data.
+
+\textbf{Catalogue and generalisation scope.} The schema requires a single fixed gross mass per SKU,
+excluding loose produce and variable-weight goods, and the mass channel cannot discriminate items
+below the noise gate. Reference photographs must be product crops in the deployment camera's own
+domain; references captured on a different camera measure the domain gap rather than the method. A
+database built with one embedding backend is meaningless to another, which the code enforces by
+refusing a mismatched backend stamp.
+
+\textbf{Internal validity.} The settlement-timing analysis assumes the firmware constants of
+Section~\ref{sec:impl}, ${\sim}100$~ms HX711 sample gating, and serial latency small relative to
+$0.5$~s. The first two are read from source; the third is an assumption pending measurement. The
+bandwidth and memory figures are arithmetic from the configuration and exclude all protocol overhead.
+
+\textbf{External validity.} A single prototype cart, one camera geometry, one mounting stiffness, one
+LAN and one small catalogue cannot support store-scale claims. Catalogue growth in particular is
+expected to degrade the all-SKU ranking~\cite{R07}, so any reported operating point is specific to the
+catalogue size at which it was measured.
+
+\textbf{Construct validity.} The metrics measure billing correctness and gate behaviour. They do not
+measure shrinkage reduction, which depends on shopper behaviour, store process and deterrence, and
+which cannot be inferred from a bench matrix. No claim about loss reduction is made.
+
+\textbf{Literature-review completeness.} The review draws on a curated pack of 85 resources, of which
+10 were read in full. It is \emph{not} a systematic review: no protocol-registered database query,
+date range, screening log or citation saturation was performed. Items reviewed only at metadata or
+abstract level are labelled in Table~\ref{tab:related}, and no claim depends on an unread full text.
+Where supplied papers contained internal inconsistencies these were recorded and their citation
+mappings were not reused.
+
+%---------------------------------------------------------------------
+\section{Conclusion and Future Work}
+
+We have specified NXTCart, a barcode-first smart shopping cart in which a scanned product's identity
+is checked by two independent, conjunctive gates: an independently recomputed settled-mass comparison
+on an Arduino/HX711, and a foreground-only visual verification on a separate host over ROS~2. We do
+not claim the barcode/weight/image combination, weight reconciliation, or weight-triggered inference
+as novel; close prior art exists for each. The design choices we document and defend are mechanical:
+retrospective selection of a dense, gap-checked evidence window from a bounded source-timestamped
+history around a settled-mass event, together with a pre-entry baseline; embedding only connected
+foreground regions so that no scene background ever reaches the network; scoring every region against
+every registered SKU so that a confident alternate product vetoes a matching region elsewhere in the
+same burst; binding every verdict to a transaction and attempt; and abstaining when the evidence
+window is incomplete.
+
+The paper's substantive analytical result is that these mechanisms are only as good as the semantics of
+their trigger. Because the settlement timestamp marks a six-sample stability decision rather than a
+mechanical impact, the shipped configuration cannot observe the product in descent and is
+self-consistent only while the impact-to-settlement delay remains between $0.40$~s and $0.90$~s,
+leaving roughly $0.30$--$0.40$~s of mechanical decay budget before the selected baseline is
+contaminated by the product itself and the system emits a mislabelled false reject. Measuring that
+delay distribution is the first required step of any deployment, and the diagnostic manifests make it
+directly checkable.
+
+We also report, as a verified fact, that the software checks pass at the stated revision --- 103
+integration and regression tests, interface parity between hosts, and an enforced deployment boundary
+--- and we state plainly that this establishes none of the system's accuracy, timing or security
+properties.
+
+Future work falls into three tiers, deliberately separated by evidential status.
+\emph{Required before any accuracy claim:} execute the protocol of Section~\ref{sec:eval}; measure
+$\Delta_s$ with an independent impact reference and re-tune $\delta_{\mathrm{pre}}$,
+$\delta_{\mathrm{base}}$ and $T_{\mathrm{buf}}$ together, or publish a distinct impact timestamp;
+measure achieved frame rate, gap distribution and wire bandwidth; replace the fixed thresholds with a
+reported risk--coverage curve on held-out confusable pairs; complete native \texttt{colcon} and
+Arduino builds and live DDS acceptance. \emph{Natural extensions of the implemented design:}
+calibrated confidence in place of raw cosine scores~\cite{R60,R61}; stronger frozen backbones or
+vision-language retrieval as drop-in replacements~\cite{R58,R59,R62}; a manifest-driven regression
+corpus so threshold changes can be replayed offline; drift compensation in the mass channel along the
+lines of~\cite{R02}; and provider-side payment authorisation with confirmed settlement~\cite{R80}.
+\emph{Proposed but unimplemented, and not to be described otherwise:} monitored-aperture light
+curtains, multiple load cells for position-resolved mass, IMU compensation for cart motion, continuous
+basket reconciliation, in-store navigation and inventory forecasting~\cite{R21}. These appear in the
+project's design material as planned work and have no implementation evidence in the code examined
+here.
+
+%---------------------------------------------------------------------
+\section*{Acknowledgment}
+[ACKNOWLEDGMENT PLACEHOLDER --- funding sources, grant numbers, institutional support, equipment loans
+and non-author contributors. The authors thank [NAMES] for [CONTRIBUTION]. Remove this section if not
+applicable; do not list any funder that has not approved acknowledgment.]
+
+%---------------------------------------------------------------------
+\begin{thebibliography}{99}
+\footnotesize
+
+\bibitem{R49} B.~Santra and D.~P.~Mukherjee, ``A comprehensive survey on computer vision based
+approaches for automatic identification of products in retail store,'' \emph{Image and Vision
+Computing}, vol.~86, pp.~45--63, 2019.
+
+\bibitem{R50} Y.~Wei, S.~Tran, S.~Xu, B.~Kang, and M.~Springer, ``Deep learning for retail product
+recognition: Challenges and techniques,'' \emph{Computational Intelligence and Neuroscience},
+vol.~2020, pp.~1--23, 2020.
+
+\bibitem{R51} R.~Oucheikh, T.~Pettersson, and T.~L\"ofstr\"om, ``Product verification using OCR
+classification and Mondrian conformal prediction,'' \emph{Expert Systems with Applications}, vol.~188,
+p.~115942, 2022.
+
+\bibitem{R81} Instacart, ``Caper Carts: Official product overview.'' [Online]. Available:
+\url{https://company.instacart.com/enterprise-platform/connected-stores/caper-carts} (accessed
+Oct.~12, 2026). Vendor product claim; not peer-reviewed evidence.
+
+\bibitem{R82} Amazon, ``5 ways the newest Dash Cart can save time and money,'' 2026. [Online].
+Available: \url{https://www.aboutamazon.com/news/retail/amazon-redesigned-dash-cart-whole-foods-market}
+(accessed Oct.~12, 2026). Vendor product claim; not peer-reviewed evidence.
+
+\bibitem{R84} V.~N.~Prithvish, S.~Agrawal, and J.~S.~R.~Alex, ``An IoT-based smart shopping cart using
+the contemporary barcode scanner,'' in \emph{Intelligent Embedded Systems}, Lecture Notes in
+Electrical Engineering 492, 2018, pp.~45--58.
+
+\bibitem{R85} U.~Gangwal, S.~Roy, and J.~Bapat, ``Smart shopping cart for automated billing purpose
+using wireless sensor networks,'' in \emph{SENSORCOMM 2013}, IARIA, 2013, pp.~168--172.
+
+\bibitem{R02} M.~Desai, B.~N.~K., M.~Shirol, K.~A.~Varun, and C.~J., ``A weight-reconciliation
+algorithm for fraud detection in smart shopping carts,'' in \emph{Proc. 4th Int. Conf. Knowledge
+Engineering and Communication Systems (ICKECS)}, 2026, pp.~1--4.
+
+\bibitem{R01} J.~Zhang, Z.~Xu, C.~Liang, and Y.~Zhu, ``Intelligent shopping cart product recognition
+system based on computer vision and multi-sensor fusion,'' in \emph{Proc. 5th Int. Conf. Communication
+Technology and Information Technology (ICCTIT)}, 2025, pp.~249--253.
+
+\bibitem{R07} Z.~Al~Adzani~Hidayat, H.~F.~Ramadhan, P.~Hidayatullah, and N.~Syakrani, ``A few-shot
+learning pipeline for retail product recognition using object detection and metric embeddings,'' in
+\emph{Proc. 8th Int. Conf. Information and Communications Technology (ICOIACT)}, 2025, pp.~42--47.
+
+\bibitem{R52} B.~Ciapas and P.~Treigys, ``Centre-loss---A preferred class verification approach over
+sample-to-sample in self-checkout products datasets,'' \emph{IET Computer Vision}, vol.~18, no.~7,
+pp.~1004--1016, 2024.
+
+\bibitem{R31} M.~Sandler, A.~Howard, M.~Zhu, A.~Zhmoginov, and L.-C.~Chen, ``MobileNetV2: Inverted
+residuals and linear bottlenecks,'' in \emph{Proc. IEEE/CVF Conf. Computer Vision and Pattern
+Recognition (CVPR)}, 2018, pp.~4510--4520.
+
+\bibitem{R54} S.~Macenski, T.~Foote, B.~Gerkey, C.~Lalancette, and W.~Woodall, ``Robot Operating
+System 2: Design, architecture, and uses in the wild,'' \emph{Science Robotics}, vol.~7, no.~66, 2022.
+
+\bibitem{R61} Y.~Geifman and R.~El-Yaniv, ``Selective classification for deep neural networks,'' in
+\emph{Advances in Neural Information Processing Systems 30}, 2017.
+
+\bibitem{R10} M.~Shahroz, M.~F.~Mushtaq, M.~Ahmad, S.~Ullah, A.~Mehmood, and G.~S.~Choi, ``IoT-based
+smart shopping cart using radio frequency identification,'' \emph{IEEE Access}, vol.~8,
+pp.~68426--68438, 2020.
+
+\bibitem{R18} P.~Chandrasekar and T.~Sangeetha, ``Smart shopping cart with automatic billing system
+through RFID and ZigBee,'' in \emph{Proc. Int. Conf. Information Communication and Embedded Systems
+(ICICES)}, 2014, pp.~1--4.
+
+\bibitem{R11} P.~A.~Jeyanthy, S.~R.~Mohamed, M.~Alarfaj, S.~S.~Reddy, and K.~S.~Jenin, ``Design and
+development of a smart shopping cart system,'' in \emph{Proc. 3rd Int. Conf. Intelligent Computing
+Instrumentation and Control Technologies (ICICICT)}, 2022, pp.~184--188.
+
+\bibitem{R12} S.~Sakthivel, A.~R.~R.~K., S.~Sai~B., V.~K.~K.~M., and G.~Kumar~C., ``AIoT-based smart
+cart system,'' in \emph{Proc. Int. Conf. Smart Technologies and Systems for Next Generation Computing
+(ICSTSN)}, 2022, pp.~1--6.
+
+\bibitem{R83} S.~Karjol, A.~K.~Holla, C.~B.~Abhilash, P.~V.~Amrutha, and Y.~V.~Manohar, ``An IoT based
+smart shopping cart for smart shopping,'' in \emph{Cognitive Computing and Information Processing},
+Communications in Computer and Information Science 801, 2018, pp.~373--385. Cited with the publisher's
+corrected five-author attribution.
+
+\bibitem{R06} R.~Li, T.~Song, N.~Capurso, J.~Yu, J.~Couture, and X.~Cheng, ``IoT applications on
+secure smart shopping system,'' \emph{IEEE Internet of Things Journal}, vol.~4, no.~6,
+pp.~1945--1954, 2017.
+
+\bibitem{R47} B.~K.~Rajithkumar, G.~M.~Deepak, B.~V.~Uma, B.~N.~Hadimani, A.~R.~Darshan, and
+C.~R.~Kamble, ``Design and development of weight sensors based smart shopping cart and rack system for
+shopping malls,'' \emph{Materials Today: Proceedings}, vol.~5, no.~4, pp.~10814--10820, 2018.
+
+\bibitem{R48} A.~Yewatkar, F.~Inamdar, R.~Singh, Ayushya, and A.~Bandal, ``Smart cart with automatic
+billing, product information, product recommendation using RFID and ZigBee with anti-theft,''
+\emph{Procedia Computer Science}, vol.~79, pp.~793--800, 2016.
+
+\bibitem{R17} B.~Chaure and P.~Jain, ``Development of e-shopping cart with theft control mechanism: No
+queue,'' in \emph{Proc. Int. Conf. Emerging Technological Trends (ICETT)}, 2016, pp.~1--5.
+
+\bibitem{R04} N.~Ragesh, B.~Giridhar, D.~Lingeshwaran, P.~Siddharth, and K.~P.~Peeyush, ``Deep
+learning based automated billing cart,'' in \emph{Proc. Int. Conf. Communication and Signal Processing
+(ICCSP)}, 2019, pp.~779--782.
+
+\bibitem{R05} T.~W.~Alessa, F.~Ahmed~Alfarhan, F.~K.~Bugis, A.~Abdulhadi~Aldawood, S.~A.~Alhuwaidi,
+and A.~Abul~Hussain, ``Smart shopping cart with machine learning, navigation, and weighing
+technologies,'' in \emph{Proc. 6th Int. Symp. Advanced Electrical and Communication Technologies
+(ISAECT)}, 2024, pp.~1--6.
+
+\bibitem{R03} A.~Naithani, T.~S.~Rajpal, and V.~Mistry, ``TAV-Cart: Transaction assistance and
+validation cart system for effortless shopping and checkout,'' in \emph{Proc. Int. Conf. Advances in
+Computing, Communication and Materials (ICACCM)}, 2024, pp.~1--6.
+
+\bibitem{R26} A.~Prabhath, A.~Anoop, and V.~Sureshkumar, ``Multi-modal product recognition and
+in-store navigation using an intelligent shopping cart,'' in \emph{Proc. 5th Int. Conf. Computer
+Networks, Big Data and IoT (ICCBI)}, 2026, pp.~1241--1245.
+
+\bibitem{R09} M.~A.~Sarwar, Y.-A.~Daraghmi, K.-W.~Liu, H.-C.~Chi, T.-U.~Ik, and Y.-L.~Li, ``Smart
+shopping carts based on mobile computing and deep learning cloud services,'' in \emph{Proc. IEEE
+Wireless Communications and Networking Conf. (WCNC)}, 2020, pp.~1--6.
+
+\bibitem{R24} Y.~Berdaliyev and A.~P.~James, ``RFID-cloud smart cart system,'' in \emph{Proc. Int.
+Conf. Advances in Computing, Communications and Informatics (ICACCI)}, 2016, pp.~2346--2352.
+
+\bibitem{R21} M.~I.~Zulfiqar, A.~Khalid, A.~Siddig, M.~J.~Nawaz, and S.~Saay, ``AI-driven smart
+shopping carts with real-time tracking and inventory forecasting for enhanced retail efficiency,''
+\emph{IEEE Access}, vol.~13, pp.~55576--55585, 2025.
+
+\bibitem{R27} L.~H.~Pham, D.~Nguyen-Ngoc~Tran, H.-H.~Nguyen, T.~H.-P.~Tran, H.-J.~Jeon, H.-M.~Jeon,
+and J.~W.~Jeon, ``DeepACO: A robust deep learning-based automatic checkout system,'' in \emph{Proc.
+IEEE/CVF Conf. Computer Vision and Pattern Recognition Workshops (CVPRW)}, 2022, pp.~3106--3113.
+
+\bibitem{R42} X.-S.~Wei, Q.~Cui, L.~Yang, P.~Wang, L.~Liu, and J.~Yang, ``RPC: A large-scale and
+fine-grained retail product checkout dataset,'' \emph{Science China Information Sciences}, vol.~65,
+no.~9, 2022.
+
+\bibitem{R38} E.~Goldman, R.~Herzig, A.~Eisenschtat, J.~Goldberger, and T.~Hassner, ``Precise
+detection in densely packed scenes,'' in \emph{Proc. IEEE/CVF Conf. Computer Vision and Pattern
+Recognition (CVPR)}, 2019, pp.~5222--5231.
+
+\bibitem{R39} M.~Klasson, C.~Zhang, and H.~Kjellstr\"om, ``A hierarchical grocery store image dataset
+with visual and semantic labels,'' in \emph{Proc. IEEE Winter Conf. Applications of Computer Vision
+(WACV)}, 2019, pp.~491--500.
+
+\bibitem{R63} Y.~Yao, X.~Tian, Z.~Tang, S.~Biswas, H.~Lei, T.~Gedeon, and L.~Zheng, ``Training with
+product digital twins for AutoRetail checkout,'' arXiv:2308.09708, 2023.
+
+\bibitem{R08} J.-Y.~Jeon, S.-W.~Kang, H.-J.~Lee, and J.-S.~Kim, ``A retail object classification
+method using multiple cameras for vision-based unmanned kiosks,'' \emph{IEEE Sensors Journal},
+vol.~22, no.~22, pp.~22200--22209, 2022.
+
+\bibitem{R30} I.~Baz, E.~Yoruk, and M.~Cetin, ``Context-aware hybrid classification system for
+fine-grained retail product recognition,'' in \emph{Proc. IEEE 12th Image, Video, and
+Multidimensional Signal Processing Workshop (IVMSP)}, 2016, pp.~1--5.
+
+\bibitem{R58} A.~Radford \emph{et al.}, ``Learning transferable visual models from natural language
+supervision,'' in \emph{Proc. 38th Int. Conf. Machine Learning (ICML)}, 2021.
+
+\bibitem{R59} M.~Oquab \emph{et al.}, ``DINOv2: Learning robust visual features without supervision,''
+arXiv:2304.07193, 2023.
+
+\bibitem{R62} E.~G.~Maminta and R.~O.~Atienza, ``What matters for grocery product retrieval with open
+source vision language models,'' arXiv:2605.18029, 2026. Cited as the verified arXiv preprint version;
+no final proceedings record is claimed.
+
+\bibitem{R45} J.~Falc\~{a}o, C.~Ruiz, S.~Pan, H.~Y.~Noh, and P.~Zhang, ``FAIM: Vision and weight
+sensing fusion framework for autonomous inventory monitoring in convenience stores,'' \emph{Frontiers
+in Built Environment}, vol.~6, 2020.
+
+\bibitem{R46} C.~Ruiz, J.~Falcao, S.~Pan, H.~Y.~Noh, and P.~Zhang, ``AIM3S: Autonomous inventory
+monitoring through multi-modal sensing for cashier-less convenience stores,'' in \emph{Proc. 6th ACM
+Int. Conf. Systems for Energy-Efficient Buildings, Cities, and Transportation}, 2019, pp.~135--144.
+
+\bibitem{R37} D.~L.~Hall and J.~Llinas, ``An introduction to multisensor data fusion,''
+\emph{Proceedings of the IEEE}, vol.~85, no.~1, pp.~6--23, 1997.
+
+\bibitem{R53} B.~Khaleghi, A.~Khamis, F.~O.~Karray, and S.~N.~Razavi, ``Multisensor data fusion: A
+review of the state-of-the-art,'' \emph{Information Fusion}, vol.~14, no.~1, pp.~28--44, 2013.
+
+\bibitem{R60} C.~Guo, G.~Pleiss, Y.~Sun, and K.~Q.~Weinberger, ``On calibration of modern neural
+networks,'' in \emph{Proc. 34th Int. Conf. Machine Learning (ICML)}, 2017.
+
+\bibitem{R34} J.~Redmon, S.~Divvala, R.~Girshick, and A.~Farhadi, ``You only look once: Unified,
+real-time object detection,'' in \emph{Proc. IEEE Conf. Computer Vision and Pattern Recognition
+(CVPR)}, 2016, pp.~779--788.
+
+\bibitem{R35} A.~Bewley, Z.~Ge, L.~Ott, F.~Ramos, and B.~Upcroft, ``Simple online and realtime
+tracking,'' in \emph{Proc. IEEE Int. Conf. Image Processing (ICIP)}, 2016, pp.~3464--3468.
+
+\bibitem{R36} N.~Wojke, A.~Bewley, and D.~Paulus, ``Simple online and realtime tracking with a deep
+association metric,'' in \emph{Proc. IEEE Int. Conf. Image Processing (ICIP)}, 2017, pp.~3645--3649.
+
+\bibitem{R72} Open Robotics, ``ROS~2 Jazzy: About quality of service settings.'' [Online]. Available:
+\url{https://docs.ros.org/en/jazzy/Concepts/Intermediate/About-Quality-of-Service-Settings.html}
+(accessed Oct.~12, 2026).
+
+\bibitem{R74} Avia Semiconductor, ``HX711: 24-bit analog-to-digital converter for weigh scales,''
+datasheet. [Online]. Available: \url{https://cdn.sparkfun.com/assets/b/f/5/a/e/hx711F_EN.pdf}
+(accessed Oct.~12, 2026).
+
+\bibitem{R75} B.~Necula and contributors, ``HX711 Arduino library.'' [Online]. Available:
+\url{https://github.com/bogde/HX711} (accessed Oct.~12, 2026).
+
+\bibitem{R79} Arduino, ``A guide to EEPROM.'' [Online]. Available:
+\url{https://github.com/arduino/docs-content/blob/main/content/learn/03.programming/07.eeprom-guide/eeprom-guide.md}
+(accessed Oct.~12, 2026).
+
+\bibitem{R78} Natural History Museum and contributors, ``pyzbar: Barcode and QR decoding.'' [Online].
+Available: \url{https://github.com/NaturalHistoryMuseum/pyzbar} (accessed Oct.~12, 2026).
+
+\bibitem{R77} OpenCV, ``Deep learning in OpenCV.'' [Online]. Available:
+\url{https://github.com/opencv/opencv/wiki/Deep-Learning-in-OpenCV} (accessed Oct.~12, 2026).
+
+\bibitem{R66} R.~Szeliski, \emph{Computer Vision: Algorithms and Applications}, 2nd~ed. Springer,
+2022.
+
+\bibitem{R80} National Payments Corporation of India, ``UPI frequently asked questions.'' [Online].
+Available: \url{https://www.npci.org.in/what-we-do/upi/faqs} (accessed Oct.~12, 2026).
+
+\end{thebibliography}
+
+\end{document}
